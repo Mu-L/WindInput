@@ -291,7 +291,10 @@ mod tests {
     #[test]
     fn rect_covers_holds_on_negative_coordinates() {
         const LEFT_MON: (i32, i32, i32, i32) = (-1920, 0, 0, 1080);
-        assert!(rect_covers((-1920, 0, 0, 1080), LEFT_MON), "负坐标全屏应算覆盖");
+        assert!(
+            rect_covers((-1920, 0, 0, 1080), LEFT_MON),
+            "负坐标全屏应算覆盖"
+        );
         assert!(
             !rect_covers((-1920, 0, 0, 1032), LEFT_MON),
             "负坐标最大化(底边止于任务栏)不应算覆盖"
