@@ -188,6 +188,12 @@ extern const GUID c_guidDisplayAttributeConverted;
 // WIND_APP_NAME 须与 Rust 侧 wind-config::variant::app_dir_name() 及安装器清单
 // [app] id 逐字一致（三处同名，无编译期约束）。
 //
+// ⛔ 本键**下面的值名**同样是跨语言约定，改一侧不编译失败也不测试失败：
+//   InstallDir        ← 三个部署方写、本 DLL 与 core 读
+//   Dota2CompatAlias  ← core 的 wind-coordinator::tsf_profile_name::ALIAS_VALUE 写、
+//                        Register.cpp 的 kAliasValueName 读。写错的表现是「升级后
+//                        用户的兼容别名被冲回真名」，只在重装时才暴露。
+//
 // ⚠️ WIND_APP_REGKEY 下的 InstallDir 是**本 DLL 唯一可靠的安装目录来源**：
 // 本 DLL 被部署到系统目录（System32\IME\<app>\，见 docs 与安装器 system_subdir）后，
 // GetModuleFileName 取到的是系统副本路径，**推不出安装目录**。三个部署方

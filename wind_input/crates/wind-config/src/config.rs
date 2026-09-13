@@ -5539,8 +5539,7 @@ pub struct SystemConfig {
     /// 内置第二、第三个名字等于替用户选一种我们无法穷举验证的取舍；把字符串交出去，
     /// 用户按自己玩的那个游戏、自己能忍的那个副作用去配。
     ///
-    /// 出厂值 [`DEFAULT_DOTA2_ALIAS`]：`郑码` 是码表方案名而非任何在世产品的品牌名
-    /// （表里其余可选项要么是竞品，要么是已停更的产品名）。
+    /// 出厂值见 [`DEFAULT_DOTA2_ALIAS`]，选它的三条理由也写在那儿。
     ///
     /// ⚠️ 留空 = 回落到出厂值，**不是**「关闭」——关闭走 [`dota2_compat`]。写注册表
     /// 那侧还会做一遍清洗与长度校验，见 `wind_coordinator::tsf_profile_name`。
@@ -5552,13 +5551,22 @@ pub struct SystemConfig {
 
 /// `system.dota2_compat_name` 的出厂值，也是 Dota 2 白名单里我们选定的那条。
 ///
-/// ⛔ **必须与游戏内表逐字一致**（半角括号、括号前后各一个半角空格、连字符前后各一个）。
-/// 差一个空格就不命中，而且没有任何报错——表现为「开了开关也还是没候选」。
-/// `wind_coordinator::tsf_profile_name` 里有一条把游戏二进制中提取的字节钉死的测试守着。
+/// ⛔ **必须与游戏内表逐字一致**。比对是全等的，差一个字符就不命中，而且没有任何
+/// 报错——表现为「开了开关也还是没候选」。下面 `dota2_alias_tests` 里有一条把游戏
+/// 二进制中提取的字节钉死的测试守着。
+///
+/// **为什么取这条**（白名单第 90 条，`canonical="Unknown"`，`product_id=0x410000`）：
+/// - 它**不含空格、括号、连字符**。表里多数条目长得像 `中文 (简体) - 郑码`，那种
+///   格式最常见的翻车方式就是括号写成全角、或空格多一个少一个，而且无从察觉；
+///   出厂值挑一条没有这些字符的，等于把最大的一类静默失效从默认路径上去掉。
+/// - 它是**通用类别名**，不是任何在世产品的品牌名，也不是某个具体码表方案名
+///   （曾用 `中文 (简体) - 郑码`，但本输入法并不提供郑码方案，那个名字对用户是误导）。
+/// - 行为上不吃亏：`0x410000`（兜底类）与原先的 `0x30000`（郑码）在「上屏后首个
+///   退格被吞」这件事上表现相同，全表只有搜狗那条分支不吞，而它全是品牌名。
 ///
 /// 定义在本 crate 而非 coordinator：serde 的 `default` 与常量必须是同一份，
 /// 分开写就多一个漂移源。
-pub const DEFAULT_DOTA2_ALIAS: &str = "中文 (简体) - 郑码";
+pub const DEFAULT_DOTA2_ALIAS: &str = "拼音输入法";
 
 fn default_dota2_alias() -> String {
     DEFAULT_DOTA2_ALIAS.to_string()
@@ -5566,9 +5574,13 @@ fn default_dota2_alias() -> String {
 
 /// `system.dota2_compat_name` 的长度上限（UTF-16 码元数，不含结尾 NUL）。
 ///
-/// 由 `wind_tsf/src/Register.cpp` 的 `wchar_t cur[256]` 定死：那边读回 `Description`
-/// 用的是固定缓冲，写进去比它长的名字读回来是**截断**的，于是「保留用户别名」的比对
-/// 必然不等，每次重装都把用户的设置冲掉。两边一起改才能放宽。
+/// **硬上限来自 C++ 侧**：`wind_tsf/src/Register.cpp` 读注册表用的是 `wchar_t[256]`
+/// 固定缓冲，值超过 255 个码元时 `RegQueryValueExW` 回 `ERROR_MORE_DATA`，那边按
+/// 「读不到」处理 ⇒ 重装/升级时别名保不住、静默写回真名。
+///
+/// 取 127 而不是 255 是留一半余量：白名单里最长的条目也才二十来个字符，127 已经
+/// 远超任何真实取值，而贴着硬上限走等于把一类只在重装时才暴露的故障留在门口。
+/// 放宽它必须先放宽 `Register.cpp` 那两个缓冲。
 pub const DOTA2_ALIAS_MAX_LEN: usize = 127;
 
 /// 清洗并校验 `system.dota2_compat_name`。
@@ -5577,10 +5589,9 @@ pub const DOTA2_ALIAS_MAX_LEN: usize = 127;
 /// 同源。写注册表的 `wind_coordinator::tsf_profile_name` 重导出本函数。
 ///
 /// 只做三件事，每件都对应一种**静默失效**：
-/// - **trim**：从设置页文本框里粘进来的名字常带首尾空格，而游戏那侧是全等比对。
-///   内部空格一个都不动——白名单里的名字本来就带空格。
-/// - **拒绝控制字符**（含换行）：注册表 `REG_SZ` 里塞控制字符会让语言栏显示成乱码，
-///   而用户在设置页里根本看不出自己粘进了什么。
+/// - **trim**：从设置页文本框里粘进来的名字常带首尾空白，而游戏那侧是全等比对。
+///   内部的**半角空格**一个都不动——白名单里的名字本来就带半角空格。
+/// - **拒绝看不见的字符**：见 [`is_invisible_troublemaker`]。
 /// - **长度上限**：见 [`DOTA2_ALIAS_MAX_LEN`]。
 ///
 /// 空串（或只有空白）**不是错误**，回落到 [`DEFAULT_DOTA2_ALIAS`]——与该字段的文档
@@ -5590,8 +5601,13 @@ pub fn sanitize_dota2_alias(raw: &str) -> Result<String, String> {
     if t.is_empty() {
         return Ok(DEFAULT_DOTA2_ALIAS.to_string());
     }
-    if t.chars().any(char::is_control) {
-        return Err("名称里不能含控制字符或换行".to_string());
+    if let Some(bad) = t.chars().find(|c| is_invisible_troublemaker(*c)) {
+        // 报出码位：这类字符在界面上和正常字符长得一模一样，不给码位用户无从下手。
+        return Err(format!(
+            "名称里有一个看不见的字符（U+{:04X}），它会让比对不命中。\
+             常见来源是从网页或文档里复制——请手工重敲一遍，空格用半角空格",
+            bad as u32
+        ));
     }
     // 按 UTF-16 码元而非 char 计数：BMP 外的字符占两个码元，按 char 算会放过
     // 一个 Register.cpp 的固定缓冲装不下的名字。
@@ -5604,6 +5620,33 @@ pub fn sanitize_dota2_alias(raw: &str) -> Result<String, String> {
     Ok(t.to_string())
 }
 
+/// 这个字符会不会让「全等比对」静默落空。
+///
+/// 白名单里的条目只含普通可见字符与**半角空格**。用户多半是从网页或文档里复制条目，
+/// 而那些来源常夹带在界面上完全看不出来的字符：
+///
+/// | 字符 | 来源 | 不拦会怎样 |
+/// |---|---|---|
+/// | U+00A0 不断行空格 | 网页排版 | 看着就是个空格，比对不命中 |
+/// | U+3000 全角空格 | 中文输入法 | 同上，且比半角宽一点、肉眼难辨 |
+/// | U+200B 零宽空格 / U+FEFF | 复制粘贴、BOM | **完全不可见**，`trim()` 也不剪 |
+/// | U+202A..U+202E 双向覆盖 | 混排文本 | 不可见，还会搅乱显示顺序 |
+/// | Cc 控制字符 | 粘贴多行 | 写进 `REG_SZ` 后语言栏显示成乱码 |
+///
+/// ⛔ 别把这些「顺手修好」（NBSP→半角空格之类）。猜错了就是替用户写下一个他没打算要的
+/// 名字，而且照样不命中；报错让他重敲一遍，代价小且结果确定。
+fn is_invisible_troublemaker(c: char) -> bool {
+    // 半角空格是唯一允许的空白：白名单里的条目就是用它分隔的。
+    c.is_control()
+        || (c.is_whitespace() && c != ' ')
+        || matches!(c,
+            '\u{00AD}'                 // 软连字符
+            | '\u{200B}'..='\u{200F}'  // 零宽空格/连字/断字 + 方向标记
+            | '\u{202A}'..='\u{202E}'  // 双向嵌入与覆盖
+            | '\u{2060}'..='\u{2064}'  // 词连接符等不可见格式符
+            | '\u{FEFF}') // BOM / 零宽不断行空格
+}
+
 #[cfg(test)]
 mod dota2_alias_tests {
     use super::*;
@@ -5611,7 +5654,7 @@ mod dota2_alias_tests {
     #[test]
     fn trims_and_falls_back_to_the_factory_alias() {
         assert_eq!(
-            sanitize_dota2_alias("  中文 (简体) - 郑码 ").unwrap(),
+            sanitize_dota2_alias("  拼音输入法 ").unwrap(),
             DEFAULT_DOTA2_ALIAS
         );
         // 留空 = 用出厂值，不是「关闭」——关闭走 system.dota2_compat 开关。
@@ -5621,6 +5664,32 @@ mod dota2_alias_tests {
         assert_eq!(
             sanitize_dota2_alias("中文 (简体) - 五笔").unwrap(),
             "中文 (简体) - 五笔"
+        );
+    }
+
+    #[test]
+    fn rejects_invisible_characters_that_look_identical() {
+        // ⛔ 回归：这几个在设置页里和正确值**长得一模一样**，放过去就是「填了、
+        // 应用了、游戏里还是没候选」，而且没有任何线索。
+        for (name, s) in [
+            ("NBSP", "中文\u{00A0}(简体) - 搜狗拼音输入法"),
+            ("全角空格", "中文\u{3000}(简体) - 搜狗拼音输入法"),
+            ("零宽空格", "拼音\u{200B}输入法"),
+            ("BOM", "\u{FEFF}拼音输入法"),
+            ("双向覆盖", "拼音\u{202E}输入法"),
+            ("软连字符", "拼音\u{00AD}输入法"),
+        ] {
+            let r = sanitize_dota2_alias(s);
+            assert!(r.is_err(), "{name} 应被拒绝，实际得到 {r:?}");
+            assert!(
+                r.unwrap_err().contains("U+"),
+                "{name} 的报错要带码位，否则用户看不出问题在哪"
+            );
+        }
+        // 半角空格是白名单条目本来就有的，一个都不能动。
+        assert_eq!(
+            sanitize_dota2_alias("中文 (简体) - 搜狗拼音输入法").unwrap(),
+            "中文 (简体) - 搜狗拼音输入法"
         );
     }
 
@@ -5639,12 +5708,14 @@ mod dota2_alias_tests {
 
     #[test]
     fn factory_alias_matches_the_hardcoded_table_byte_for_byte() {
-        // 从 Dota 2 的 imemanager.dll 里原样提取的 UTF-8 字节（2026-09-06）。
+        // 从 Dota 2 的 imemanager.dll 里原样提取的 UTF-8 字节：白名单第 90 条
+        // （`canonical="Unknown"`, `product_id=0x410000`），2026-09-13 复核。
         // 这条断言的作用不是「测代码」，而是把那串字节钉在仓里：出厂别名一旦被人
-        // 顺手「整理」成全角括号或改了空格，开关就会静默失效，而现象只在游戏里看得到。
+        // 顺手「整理」（换成全角、加空格、改用词），开关就会静默失效，而现象只在
+        // 游戏里看得到。改出厂值必须重新从二进制里取字节，不能照着屏幕抄。
         const FROM_BINARY: &[u8] = &[
-            0xE4, 0xB8, 0xAD, 0xE6, 0x96, 0x87, 0x20, 0x28, 0xE7, 0xAE, 0x80, 0xE4, 0xBD, 0x93,
-            0x29, 0x20, 0x2D, 0x20, 0xE9, 0x83, 0x91, 0xE7, 0xA0, 0x81,
+            0xE6, 0x8B, 0xBC, 0xE9, 0x9F, 0xB3, 0xE8, 0xBE, 0x93, 0xE5, 0x85, 0xA5, 0xE6, 0xB3,
+            0x95,
         ];
         assert_eq!(
             DEFAULT_DOTA2_ALIAS.as_bytes(),

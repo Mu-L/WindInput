@@ -124,6 +124,9 @@ static BOOL _ReadRecordedAlias(wchar_t* out, DWORD cchOut)
                       &hKey) != ERROR_SUCCESS)
         return FALSE;
 
+    // ⚠️ 缓冲 256 个码元（含 NUL）是 wind-config `DOTA2_ALIAS_MAX_LEN` 的硬上限来源：
+    // 值比缓冲长时 RegQueryValueExW 回 ERROR_MORE_DATA，下面当作「读不到」处理 ⇒
+    // 别名保不住、静默写回真名。放宽那个上限必须先放宽这里。
     DWORD type = 0;
     DWORD cb = cchOut * sizeof(wchar_t);
     LSTATUS st = RegQueryValueExW(hKey, kAliasValueName, nullptr, &type,
@@ -143,6 +146,35 @@ static BOOL _ReadRecordedAlias(wchar_t* out, DWORD cchOut)
     return out[0] != L'\0';
 }
 
+// 读当前登记的 Description。键或值不存在时回 FALSE —— 这**不是**异常情况，见下。
+static BOOL _ReadCurrentDescription(const wchar_t* path, wchar_t* out, DWORD cchOut)
+{
+    if (out == nullptr || cchOut == 0) return FALSE;
+    out[0] = L'\0';
+
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+
+    DWORD type = 0;
+    DWORD cb = cchOut * sizeof(wchar_t);
+    LSTATUS st = RegQueryValueExW(hKey, L"Description", nullptr, &type,
+                                  reinterpret_cast<LPBYTE>(out), &cb);
+    RegCloseKey(hKey);
+    // ERROR_MORE_DATA（值比缓冲长）也走这里：读不全就当读不到，绝不拿半截串去比对。
+    if (st != ERROR_SUCCESS || type != REG_SZ || cb < sizeof(wchar_t))
+    {
+        out[0] = L'\0';
+        return FALSE;
+    }
+    // REG_SZ 未必以 NUL 收尾（写入方可能没把结尾计入长度），比对前显式收口，
+    // 否则 wcscmp 会读出缓冲外。
+    DWORD cch = cb / sizeof(wchar_t);
+    if (cch >= cchOut) { cch = cchOut - 1; }
+    out[cch] = L'\0';
+    return TRUE;
+}
+
 // 注册时应当写入的显示名。
 //
 // ★ 用户可能开着「Valve 游戏兼容」——那个开关把本输入法在系统里登记的名称改成了
@@ -151,8 +183,26 @@ static BOOL _ReadRecordedAlias(wchar_t* out, DWORD cchOut)
 // Description 的：安装/升级重跑一次就把用户的设置冲掉了，没有任何提示，用户只会在
 // 某次更新之后发现游戏里又打不出字，而设置页仍显示「已开启」。
 //
-// 判据：已登记的名称等于 core 记下的那个别名（或老装机的历史别名）就原样保留；
-// 其余情况（首次安装、名称是真名、或被别的东西改成了第三种值）一律写回 TEXTSERVICE_NAME。
+// ⛔⛔ **判据不能只看当前 Description**。安装/升级走的是「先反注册、再注册」
+// （wind-installer 的 UnregisterOldCom → RegisterCom；dev.ps1 的 Unregister-Tsf →
+// Register-Tsf），而反注册调的 `ITfInputProcessorProfiles::Unregister(CLSID)` 会把整个
+// `HKLM\SOFTWARE\Microsoft\CTF\TIP\{CLSID}` 连同 LanguageProfile 与 Description 一起删掉。
+// 等这里跑到时那个键**根本不存在** —— 2026-09-13 在实测机上用 dev 变体（另一对 GUID，
+// 不碰正在用的注册）逐步验过：
+//     regsvr32 /u 后  → TIP\{CLSID} 不存在、Description 没了（我们自己键下的记录值还在）
+//     重新注册后      → Description 被写回真名，别名丢失
+// 也就是说「读 Description 来判断要不要保留」这条路在**唯一会触发它的场景**里必然落空。
+// 本函数最初那版（以及更早那版只认硬编码别名的）都栽在这里，且毫无痕迹。
+//
+// 故判据以**记录值**为准（core 落地开关时写下，见 wind-coordinator::tsf_profile_name）：
+//   1. 有记录值 ⇒ 用它。键被删光也照样认得出用户的选择，这正是它存在的理由。
+//      首装是安全的：记录值只有 core 执行过「开启」才会写，关闭时会被删掉，
+//      没开过兼容的机器上它根本不存在。
+//   2. 没有记录值、但当前 Description 恰是历史别名 ⇒ 老装机（2026-09 之前开的兼容，
+//      那时还没有记录值）。只有「键没被删」的路径能走到这（如手工 regsvr32 覆盖注册）；
+//      走到了就保住，core 下次落地开关时会把记录值补上，此后走第 1 条。
+//   3. 其余（首次安装、名称是真名、被别的东西改成了第三种值）⇒ TEXTSERVICE_NAME。
+//
 // ⛔ 别放宽成「保留任何非真名的值」——那会把误写与脏值也一并固化下来。名字可配置之后
 //    这条更要守住：放宽等于把任何一次误写永久固化，而用户根本看不出是哪一步写坏的。
 //
@@ -160,6 +210,14 @@ static BOOL _ReadRecordedAlias(wchar_t* out, DWORD cchOut)
 static const wchar_t* _ProfileNameToRegister()
 {
     static wchar_t s_kept[256] = {};
+
+    wchar_t recorded[256] = {};
+    if (_ReadRecordedAlias(recorded, ARRAYSIZE(recorded)))
+    {
+        WIND_LOG_INFO_FMT(L"RegisterProfile: 保留用户已登记的兼容别名 [%ls]\n", recorded);
+        StringCchCopyW(s_kept, ARRAYSIZE(s_kept), recorded);
+        return s_kept;
+    }
 
     wchar_t clsid[64] = {};
     wchar_t profile[64] = {};
@@ -170,35 +228,9 @@ static const wchar_t* _ProfileNameToRegister()
     swprintf_s(path, L"SOFTWARE\\Microsoft\\CTF\\TIP\\%s\\LanguageProfile\\0x%08X\\%s",
                clsid, (unsigned)TEXTSERVICE_LANGID, profile);
 
-    HKEY hKey = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
-        return TEXTSERVICE_NAME;
-
-    // ⚠️ 这个 256 的缓冲就是 wind-config `DOTA2_ALIAS_MAX_LEN`（127）的由来：
-    // 比它长的名字在这里读回来是**截断**的，下面的比对必然不等，于是每次重装都把
-    // 用户的设置冲掉。放宽长度上限必须先放宽这里。
     wchar_t cur[256] = {};
-    DWORD cb = sizeof(cur);
-    DWORD type = 0;
-    LSTATUS st = RegQueryValueExW(hKey, L"Description", nullptr, &type, (LPBYTE)cur, &cb);
-    RegCloseKey(hKey);
-    if (st != ERROR_SUCCESS || type != REG_SZ) return TEXTSERVICE_NAME;
-    // 同上：REG_SZ 未必以 NUL 收尾，比对前先收口，否则 wcscmp 会读出缓冲外。
-    if (cb < sizeof(wchar_t)) return TEXTSERVICE_NAME;
-    DWORD curCch = cb / sizeof(wchar_t);
-    if (curCch >= ARRAYSIZE(cur)) { curCch = ARRAYSIZE(cur) - 1; }
-    cur[curCch] = L'\0';
+    if (!_ReadCurrentDescription(path, cur, ARRAYSIZE(cur))) return TEXTSERVICE_NAME;
 
-    wchar_t recorded[256] = {};
-    if (_ReadRecordedAlias(recorded, ARRAYSIZE(recorded)) && wcscmp(cur, recorded) == 0)
-    {
-        WIND_LOG_INFO_FMT(L"RegisterProfile: 保留用户已登记的兼容别名 [%ls]\n", recorded);
-        StringCchCopyW(s_kept, ARRAYSIZE(s_kept), recorded);
-        return s_kept;
-    }
-
-    // 老装机兜底：2026-09 之前开过兼容的机器没有记录值，认历史别名。core 下次落地
-    // 开关时会把记录值补上，此后走上面那条。
     if (wcscmp(cur, kLegacyDota2CompatAlias) == 0)
     {
         WIND_LOG_INFO(L"RegisterProfile: 保留老版本写下的 Dota 2 兼容别名\n");
