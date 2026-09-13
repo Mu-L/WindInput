@@ -96,23 +96,71 @@ static HRESULT UnregisterCOMServer()
 }
 
 // --- 2. 语言配置文件 (Profile) 注册与卸载 ---
-// Dota 2 兼容别名。⛔ 必须与 wind-coordinator 的 `tsf_profile_name::DOTA2_ALIAS`
-// **逐字一致**（那边有一条测试把从游戏二进制里提取的字节钉死，以那份为准）。
-static const wchar_t* const kDota2CompatAlias = L"中文 (简体) - 郑码";
+//
+// 2026-09 之前写死的那个 Dota 2 兼容别名。**只用于识别老装机**：那时别名不可配置，
+// 也没有下面那条记录值，于是升级后第一次注册只能靠「当前值恰好等于它」来认出
+// 「用户开着兼容」。新写入一律走记录值，故这里不必跟着 wind-config 的出厂值走——
+// 它就是一个历史常量，改了反而会认不出老装机。
+static const wchar_t* const kLegacyDota2CompatAlias = L"中文 (简体) - 郑码";
+
+// 「当前登记的名字是我们自己写上去的」这条记录，由 core 在落地开关时写下。
+// ⛔ 值名与写入方必须一致：wind-coordinator 的 `tsf_profile_name::ALIAS_VALUE`。
+static const wchar_t* const kAliasValueName = L"Dota2CompatAlias";
+
+// 读 core 记下的别名。取不到（未开启 / 老版本 / 键不在）回 FALSE。
+//
+// ★ KEY_WOW64_64KEY 不可省，理由与 InstallPaths.cpp 读 InstallDir 那处完全相同：
+// WIND_APP_REGKEY 是 HKLM\Software 下的**普通键**，32 位的 wind_tsf_x86.dll 不加这个
+// 标志会被重定向到 Software\Wow6432Node\，而写入方（core）是 64 位、只写得进 64 位视图。
+// 漏了它的表现是：x86 那次注册认不出别名，把 Description 写回真名——而 x86 是后注册的,
+// 于是它覆盖 x64 刚刚保留好的值，用户的设置照样丢。
+static BOOL _ReadRecordedAlias(wchar_t* out, DWORD cchOut)
+{
+    if (out == nullptr || cchOut == 0) return FALSE;
+    out[0] = L'\0';
+
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, WIND_APP_REGKEY, 0, KEY_READ | KEY_WOW64_64KEY,
+                      &hKey) != ERROR_SUCCESS)
+        return FALSE;
+
+    DWORD type = 0;
+    DWORD cb = cchOut * sizeof(wchar_t);
+    LSTATUS st = RegQueryValueExW(hKey, kAliasValueName, nullptr, &type,
+                                  reinterpret_cast<LPBYTE>(out), &cb);
+    RegCloseKey(hKey);
+
+    // REG_SZ 不保证以 NUL 收尾（写入方可能未把结尾计入长度），显式收口——
+    // 与 InstallPaths.cpp 同一处理。
+    if (st != ERROR_SUCCESS || type != REG_SZ || cb < sizeof(wchar_t))
+    {
+        out[0] = L'\0';
+        return FALSE;
+    }
+    DWORD cch = cb / sizeof(wchar_t);
+    if (cch >= cchOut) { cch = cchOut - 1; }
+    out[cch] = L'\0';
+    return out[0] != L'\0';
+}
 
 // 注册时应当写入的显示名。
 //
-// ★ 用户可能开着「Dota 2 兼容」——那个开关把本输入法在系统里登记的名称改成了上面
-// 那个别名（Dota 2 按名称查一张硬编码白名单，决定要不要由游戏自己绘制候选，见
+// ★ 用户可能开着「Valve 游戏兼容」——那个开关把本输入法在系统里登记的名称改成了
+// 用户选定的别名（游戏按名称查一张硬编码白名单，决定要不要由游戏自己绘制候选，见
 // docs/design/game-compat-tsf-uielement.md §1.1）。而 RegisterProfile 是**无条件覆盖**
 // Description 的：安装/升级重跑一次就把用户的设置冲掉了，没有任何提示，用户只会在
 // 某次更新之后发现游戏里又打不出字，而设置页仍显示「已开启」。
 //
-// 故：已登记的名称若正是那个别名，就原样保留；其余情况（首次安装、名称是真名、
-// 或被别的东西改成了第三种值）一律写回 TEXTSERVICE_NAME。
-// ⛔ 别放宽成「保留任何非真名的值」——那会把误写与脏值也一并固化下来。
+// 判据：已登记的名称等于 core 记下的那个别名（或老装机的历史别名）就原样保留；
+// 其余情况（首次安装、名称是真名、或被别的东西改成了第三种值）一律写回 TEXTSERVICE_NAME。
+// ⛔ 别放宽成「保留任何非真名的值」——那会把误写与脏值也一并固化下来。名字可配置之后
+//    这条更要守住：放宽等于把任何一次误写永久固化，而用户根本看不出是哪一步写坏的。
+//
+// 返回的指针指向函数内的静态缓冲，仅在注册流程（单线程、regsvr32 里跑一次）内有效。
 static const wchar_t* _ProfileNameToRegister()
 {
+    static wchar_t s_kept[256] = {};
+
     wchar_t clsid[64] = {};
     wchar_t profile[64] = {};
     if (StringFromGUID2(c_clsidTextService, clsid, ARRAYSIZE(clsid)) == 0) return TEXTSERVICE_NAME;
@@ -126,17 +174,35 @@ static const wchar_t* _ProfileNameToRegister()
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
         return TEXTSERVICE_NAME;
 
+    // ⚠️ 这个 256 的缓冲就是 wind-config `DOTA2_ALIAS_MAX_LEN`（127）的由来：
+    // 比它长的名字在这里读回来是**截断**的，下面的比对必然不等，于是每次重装都把
+    // 用户的设置冲掉。放宽长度上限必须先放宽这里。
     wchar_t cur[256] = {};
     DWORD cb = sizeof(cur);
     DWORD type = 0;
     LSTATUS st = RegQueryValueExW(hKey, L"Description", nullptr, &type, (LPBYTE)cur, &cb);
     RegCloseKey(hKey);
     if (st != ERROR_SUCCESS || type != REG_SZ) return TEXTSERVICE_NAME;
+    // 同上：REG_SZ 未必以 NUL 收尾，比对前先收口，否则 wcscmp 会读出缓冲外。
+    if (cb < sizeof(wchar_t)) return TEXTSERVICE_NAME;
+    DWORD curCch = cb / sizeof(wchar_t);
+    if (curCch >= ARRAYSIZE(cur)) { curCch = ARRAYSIZE(cur) - 1; }
+    cur[curCch] = L'\0';
 
-    if (wcscmp(cur, kDota2CompatAlias) == 0)
+    wchar_t recorded[256] = {};
+    if (_ReadRecordedAlias(recorded, ARRAYSIZE(recorded)) && wcscmp(cur, recorded) == 0)
     {
-        WIND_LOG_INFO(L"RegisterProfile: 保留用户已开启的 Dota 2 兼容别名\n");
-        return kDota2CompatAlias;
+        WIND_LOG_INFO_FMT(L"RegisterProfile: 保留用户已登记的兼容别名 [%ls]\n", recorded);
+        StringCchCopyW(s_kept, ARRAYSIZE(s_kept), recorded);
+        return s_kept;
+    }
+
+    // 老装机兜底：2026-09 之前开过兼容的机器没有记录值，认历史别名。core 下次落地
+    // 开关时会把记录值补上，此后走上面那条。
+    if (wcscmp(cur, kLegacyDota2CompatAlias) == 0)
+    {
+        WIND_LOG_INFO(L"RegisterProfile: 保留老版本写下的 Dota 2 兼容别名\n");
+        return kLegacyDota2CompatAlias;
     }
     return TEXTSERVICE_NAME;
 }

@@ -5511,11 +5511,11 @@ fn default_log_max_files() -> usize {
 /// 这个域装的是「我们**怎样向 Windows 登记自己**」，而不是输入行为——改这里的键会
 /// 改变系统层面的注册结果（注册名、关联等），因此每一项都需要管理员权限才能落地，
 /// 且对已启动的宿主进程不生效（宿主是在启动时读的）。
-// 出厂值恰好全等于各字段类型的 Default（bool → false），故直接 derive。
-// ⚠️ 将来加入「出厂值不等于类型 Default」的键时，须改回手写 impl Default。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemConfig {
-    /// Dota 2 兼容：把本输入法在系统里登记的名称改为 `中文 (简体) - 郑码`。
+    /// Dota 2 兼容：把本输入法在系统里登记的名称改为 [`dota2_compat_name`] 指定的那个。
+    ///
+    /// [`dota2_compat_name`]: SystemConfig::dota2_compat_name
     ///
     /// ★ 这不是玄学，是 Dota 2 那侧写死的判据。起源2引擎的 `imemanager.dll` 里有一张
     /// **硬编码的输入法白名单**，按注册表中该输入法的 TSF Profile Description 做**全等**
@@ -5524,13 +5524,157 @@ pub struct SystemConfig {
     /// 还会多出一个系统默认 IME 小窗。判据与完整证据见
     /// `docs/design/game-compat-tsf-uielement.md` §1.1。
     ///
-    /// 代价是**语言栏和 Windows 设置里显示的名字会跟着变**。取 `郑码` 是因为它是码表
-    /// 方案名而非任何在世产品的品牌名（表里其余可选项要么是竞品，要么是已停更的产品名）。
+    /// 代价是**语言栏和 Windows 设置里显示的名字会跟着变**。
     ///
     /// 出厂关闭：这是拿「系统里的显示名」换「一个游戏里的候选」，取舍不对称，
     /// 只能由知情的用户自己决定。
     #[serde(default)]
     pub dota2_compat: bool,
+
+    /// 开启 [`dota2_compat`] 后要登记的名称。
+    ///
+    /// **为什么开放成自由文本而不是内置一张表**：白名单上那 145 条都是别家输入法的
+    /// 名字，逐条实测下来行为还各不相同（`product_id` 决定走哪个兼容分支，有的分支
+    /// 会吞掉上屏后的第一个退格，见 `docs/design/game-compat-tsf-uielement.md` §1.3）。
+    /// 内置第二、第三个名字等于替用户选一种我们无法穷举验证的取舍；把字符串交出去，
+    /// 用户按自己玩的那个游戏、自己能忍的那个副作用去配。
+    ///
+    /// 出厂值 [`DEFAULT_DOTA2_ALIAS`]：`郑码` 是码表方案名而非任何在世产品的品牌名
+    /// （表里其余可选项要么是竞品，要么是已停更的产品名）。
+    ///
+    /// ⚠️ 留空 = 回落到出厂值，**不是**「关闭」——关闭走 [`dota2_compat`]。写注册表
+    /// 那侧还会做一遍清洗与长度校验，见 `wind_coordinator::tsf_profile_name`。
+    ///
+    /// [`dota2_compat`]: SystemConfig::dota2_compat
+    #[serde(default = "default_dota2_alias")]
+    pub dota2_compat_name: String,
+}
+
+/// `system.dota2_compat_name` 的出厂值，也是 Dota 2 白名单里我们选定的那条。
+///
+/// ⛔ **必须与游戏内表逐字一致**（半角括号、括号前后各一个半角空格、连字符前后各一个）。
+/// 差一个空格就不命中，而且没有任何报错——表现为「开了开关也还是没候选」。
+/// `wind_coordinator::tsf_profile_name` 里有一条把游戏二进制中提取的字节钉死的测试守着。
+///
+/// 定义在本 crate 而非 coordinator：serde 的 `default` 与常量必须是同一份，
+/// 分开写就多一个漂移源。
+pub const DEFAULT_DOTA2_ALIAS: &str = "中文 (简体) - 郑码";
+
+fn default_dota2_alias() -> String {
+    DEFAULT_DOTA2_ALIAS.to_string()
+}
+
+/// `system.dota2_compat_name` 的长度上限（UTF-16 码元数，不含结尾 NUL）。
+///
+/// 由 `wind_tsf/src/Register.cpp` 的 `wchar_t cur[256]` 定死：那边读回 `Description`
+/// 用的是固定缓冲，写进去比它长的名字读回来是**截断**的，于是「保留用户别名」的比对
+/// 必然不等，每次重装都把用户的设置冲掉。两边一起改才能放宽。
+pub const DOTA2_ALIAS_MAX_LEN: usize = 127;
+
+/// 清洗并校验 `system.dota2_compat_name`。
+///
+/// 放在本 crate 而不是写注册表那侧：纯逻辑、与平台无关，且必须与 [`DEFAULT_DOTA2_ALIAS`]
+/// 同源。写注册表的 `wind_coordinator::tsf_profile_name` 重导出本函数。
+///
+/// 只做三件事，每件都对应一种**静默失效**：
+/// - **trim**：从设置页文本框里粘进来的名字常带首尾空格，而游戏那侧是全等比对。
+///   内部空格一个都不动——白名单里的名字本来就带空格。
+/// - **拒绝控制字符**（含换行）：注册表 `REG_SZ` 里塞控制字符会让语言栏显示成乱码，
+///   而用户在设置页里根本看不出自己粘进了什么。
+/// - **长度上限**：见 [`DOTA2_ALIAS_MAX_LEN`]。
+///
+/// 空串（或只有空白）**不是错误**，回落到 [`DEFAULT_DOTA2_ALIAS`]——与该字段的文档
+/// 一致：留空意为「用出厂值」，关闭要走 `system.dota2_compat` 开关。
+pub fn sanitize_dota2_alias(raw: &str) -> Result<String, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(DEFAULT_DOTA2_ALIAS.to_string());
+    }
+    if t.chars().any(char::is_control) {
+        return Err("名称里不能含控制字符或换行".to_string());
+    }
+    // 按 UTF-16 码元而非 char 计数：BMP 外的字符占两个码元，按 char 算会放过
+    // 一个 Register.cpp 的固定缓冲装不下的名字。
+    let len = t.encode_utf16().count();
+    if len > DOTA2_ALIAS_MAX_LEN {
+        return Err(format!(
+            "名称过长（{len} 个字符，上限 {DOTA2_ALIAS_MAX_LEN}）"
+        ));
+    }
+    Ok(t.to_string())
+}
+
+#[cfg(test)]
+mod dota2_alias_tests {
+    use super::*;
+
+    #[test]
+    fn trims_and_falls_back_to_the_factory_alias() {
+        assert_eq!(
+            sanitize_dota2_alias("  中文 (简体) - 郑码 ").unwrap(),
+            DEFAULT_DOTA2_ALIAS
+        );
+        // 留空 = 用出厂值，不是「关闭」——关闭走 system.dota2_compat 开关。
+        assert_eq!(sanitize_dota2_alias("").unwrap(), DEFAULT_DOTA2_ALIAS);
+        assert_eq!(sanitize_dota2_alias("   ").unwrap(), DEFAULT_DOTA2_ALIAS);
+        // 内部空格一个都不能动：白名单里的名字就是带空格的。
+        assert_eq!(
+            sanitize_dota2_alias("中文 (简体) - 五笔").unwrap(),
+            "中文 (简体) - 五笔"
+        );
+    }
+
+    #[test]
+    fn rejects_what_would_fail_silently() {
+        // 控制字符：写进 REG_SZ 后语言栏显示成乱码，而设置页里看不出粘进了什么。
+        assert!(sanitize_dota2_alias("中文\n郑码").is_err());
+        assert!(sanitize_dota2_alias("中文\t郑码").is_err());
+        // 超长：Register.cpp 的 wchar_t cur[256] 读回来是截断的，比对必然不等，
+        // 于是每次重装都把用户的设置冲掉。
+        assert!(sanitize_dota2_alias(&"あ".repeat(DOTA2_ALIAS_MAX_LEN)).is_ok());
+        assert!(sanitize_dota2_alias(&"あ".repeat(DOTA2_ALIAS_MAX_LEN + 1)).is_err());
+        // 按 UTF-16 码元算，不是按 char：BMP 外的字符占两个码元。
+        assert!(sanitize_dota2_alias(&"𠀀".repeat(DOTA2_ALIAS_MAX_LEN / 2 + 1)).is_err());
+    }
+
+    #[test]
+    fn factory_alias_matches_the_hardcoded_table_byte_for_byte() {
+        // 从 Dota 2 的 imemanager.dll 里原样提取的 UTF-8 字节（2026-09-06）。
+        // 这条断言的作用不是「测代码」，而是把那串字节钉在仓里：出厂别名一旦被人
+        // 顺手「整理」成全角括号或改了空格，开关就会静默失效，而现象只在游戏里看得到。
+        const FROM_BINARY: &[u8] = &[
+            0xE4, 0xB8, 0xAD, 0xE6, 0x96, 0x87, 0x20, 0x28, 0xE7, 0xAE, 0x80, 0xE4, 0xBD, 0x93,
+            0x29, 0x20, 0x2D, 0x20, 0xE9, 0x83, 0x91, 0xE7, 0xA0, 0x81,
+        ];
+        assert_eq!(
+            DEFAULT_DOTA2_ALIAS.as_bytes(),
+            FROM_BINARY,
+            "出厂别名与 Dota 2 白名单里的字节不一致，开关会静默失效"
+        );
+    }
+
+    #[test]
+    fn default_system_config_keeps_the_alias_non_empty() {
+        // ⛔ 回归守卫：SystemConfig 若被改回 #[derive(Default)]，本键会静默变成空串，
+        // 表现为「开了开关，系统里的名字被改成了空」——语言栏上一片空白，且无任何报错。
+        assert_eq!(
+            SystemConfig::default().dota2_compat_name,
+            DEFAULT_DOTA2_ALIAS
+        );
+        assert!(!SystemConfig::default().dota2_compat);
+    }
+}
+
+// 出厂值不全等于各字段类型的 Default（`dota2_compat_name` 非空），故手写。
+// ⚠️ 加新键时别图省事改回 derive：那会让本键静默变成空串，表现为「开了开关，
+// 系统里的名字被改成了空」——语言栏上就是一片空白，且没有任何报错。
+impl Default for SystemConfig {
+    fn default() -> Self {
+        Self {
+            dota2_compat: false,
+            dota2_compat_name: default_dota2_alias(),
+        }
+    }
 }
 
 // ───────────────────────── 共享 default 助手 ─────────────────────────

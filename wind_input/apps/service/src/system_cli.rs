@@ -14,14 +14,17 @@ const USAGE: &str = "\
 用法: wind_input system <动作>
 
 动作:
-  dota2-compat on|off   切换 Dota 2 兼容（改本输入法在系统里登记的显示名）
-  dota2-compat status   显示当前登记的名称
-  help                  显示本帮助
+  dota2-compat on [--name <名称>]   开启兼容（改本输入法在系统里登记的显示名）
+  dota2-compat off                 关闭，还原为真实名称
+  dota2-compat status              显示当前登记的名称
+  help                             显示本帮助
 
 说明: Dota 2 按输入法名称查一张内置白名单决定要不要由游戏绘制候选，
       不在表内就取不到候选、还会多出一个左上角的系统 IME 小窗。
       开启后语言栏与 Windows 设置里显示的名称会随之改变。
-      写 HKLM，需管理员权限；改完需重启游戏才生效。";
+      写 HKLM，需管理员权限；改完需重启游戏才生效。
+
+      --name 省略时用出厂别名。名称含空格，shell 里要整体加引号。";
 
 /// 子命令入口。`args` 为 `system` 之后的参数。返回进程退出码。
 pub fn run(args: &[String]) -> i32 {
@@ -49,7 +52,16 @@ fn dota2_compat(args: &[String]) -> i32 {
             return 2;
         }
     };
-    match tsf_profile_name::set_dota2_compat(want) {
+    // 名称由调用方显式传入，理由同本文件头部那条「不读配置」：提权进程读到的
+    // %APPDATA% 未必是拧开关那个用户的。省略即出厂别名。
+    let alias = match parse_name(&args[1..]) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 2;
+        }
+    };
+    match tsf_profile_name::set_dota2_compat(want, &alias) {
         Ok(true) => {
             println!(
                 "✓ 已{}Dota 2 兼容；当前登记名称: {}",
@@ -74,6 +86,12 @@ fn dota2_compat(args: &[String]) -> i32 {
             eprintln!("找不到本输入法的 TSF 注册项，可能尚未安装或注册失败。");
             1
         }
+        // 名称过不了清洗（含控制字符/超长）。这是用户输入错误，不是系统故障，
+        // 报 2（用法错）而不是 1。
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            eprintln!("名称不可用: {e}");
+            2
+        }
         Err(e) => {
             eprintln!("写注册表失败: {e}");
             1
@@ -81,9 +99,28 @@ fn dota2_compat(args: &[String]) -> i32 {
     }
 }
 
+/// 解析 `--name <名称>`。省略时回出厂别名。
+///
+/// 手写而不引入参数解析库：整个 `system` 子命令就这一个可选参数，且它是**最后**一个
+/// 位置——把剩余参数整体当名字会吞掉将来新加的参数，故要求显式 `--name`。
+fn parse_name(rest: &[String]) -> Result<String, String> {
+    match rest {
+        [] => Ok(tsf_profile_name::DOTA2_ALIAS.to_string()),
+        [flag, value] if flag == "--name" => Ok(value.clone()),
+        [flag] if flag == "--name" => Err("--name 后面缺少名称".to_string()),
+        _ => Err(format!(
+            "无法识别的参数: {}\n用法: wind_input system dota2-compat on [--name <名称>]",
+            rest.join(" ")
+        )),
+    }
+}
+
 fn dota2_status() -> i32 {
     println!("当前登记名称: {}", describe_current());
-    println!("Dota 2 兼容别名: {}", tsf_profile_name::DOTA2_ALIAS);
+    println!(
+        "出厂别名（--name 省略时用它）: {}",
+        tsf_profile_name::DOTA2_ALIAS
+    );
     0
 }
 
