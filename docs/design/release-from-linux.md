@@ -1,8 +1,8 @@
 # 从 Linux 发版：流程与检查点
 
-> **状态（2026-09-13）**：签名段已端到端实测通过；**tag/push 段与 sign-draft 段尚未在
-> Linux 上完整跑过**，本文的命令由 `scripts/release.ps1` 逐段翻译而来。第一次照此发版
-> 请逐步确认，不要挂上 `--yes` 一把梭。哪些验过、哪些没验，每节都标了。
+> **状态（2026-09-13）**：**全流程已在 Linux 上端到端跑通一次**（v0.121.2，CI run
+> 34735825809），从五仓打 tag 一直到签名产物上传 Release、摘掉未签名横幅。本文命令
+> 均为实跑verbatim，非纸面翻译。
 
 开发主力迁到 Linux 后，`scripts/release.ps1` 跑不了了（它是 PowerShell，且 `sign-draft`
 段要调 `dev.ps1`）。本文记录在 Linux 上手工完成一次发版的完整序列，供日后固化成
@@ -124,7 +124,7 @@ ssh "$BUILD_HOST" "pwsh -NoProfile -Command \"Set-Location '\$BUILD_ROOT'; .\\sc
 
 ## 5. 打 tag 与推送
 
-**⚠️ 未在 Linux 实测**（逐段译自 `release.ps1` 的 `Invoke-Release`）。
+**✅ 已实测**（v0.121.2）。
 
 ```bash
 cd ~/develop/windinput
@@ -160,7 +160,7 @@ git -C WindInput push origin "v$V"
 
 ## 6. 等 CI
 
-**⚠️ 未在 Linux 实测。**
+**✅ 已实测**（v0.121.2，CI 约 17 分钟）。
 
 ```bash
 cd ~/develop/windinput/WindInput
@@ -184,8 +184,20 @@ gh run watch <runId>           # 或轮询 gh run view <runId>
 
 ## 7. 签名段：委托 VM
 
-**✅ 本节的签名部分已实测通过（2026-09-13，v0.121.2）**，只是当时的产物来自本地编译而非
-CI artifact；下载与回传两步未实测。
+**✅ 已实测**（v0.121.2，含从 CI artifact 下载与回传）。
+
+⚠️ **开工前先清空编译机的 `dist/`**。若之前在编译机上本地编译过同版本号，`dist\` 里会
+躺着**同名**的 Setup/Portable —— 和 CI 版混在一起，签完根本分不清签的是哪一份。移进
+`dist\_archive\<标记>\` 即可（只移不删）：
+
+```bash
+ssh "$BUILD_HOST" "pwsh -NoProfile -Command \"
+  \$d='$BUILD_ROOT/dist'; \$a=Join-Path \$d ('_archive/pre-release-'+(Get-Date -Format 'MMdd-HHmm'))
+  New-Item -ItemType Directory \$a -Force | Out-Null
+  Get-ChildItem \$d -File | Where-Object { \$_.Name -match '^WindInput(Dev)?-(Setup|Portable|Stage)-' } |
+      Move-Item -Destination \$a -Force
+\""
+```
 
 ```bash
 cd ~/develop/windinput/WindInput
@@ -272,7 +284,7 @@ ssh "$BUILD_HOST" "pwsh -NoProfile -File '$BUILD_ROOT/../verify-portable.ps1'"
 
 ## 8. 上传 Release 并去掉未签名横幅
 
-**⚠️ 未在 Linux 实测。**
+**✅ 已实测**（v0.121.2）。
 
 ```bash
 cd ~/develop/windinput/WindInput
@@ -285,9 +297,34 @@ gh release upload "v$V" \
 
 # 正文里 CI 加的未签名横幅要摘掉
 gh release view "v$V" --json body -q .body > /tmp/body.md
-# 编辑 /tmp/body.md 删掉未签名横幅段落
-gh release edit "v$V" --notes-file /tmp/body.md
+python3 /tmp/strip-banner.py < /tmp/body.md > /tmp/body-clean.md
+gh release edit "v$V" --notes-file /tmp/body-clean.md
 ```
+
+`/tmp/strip-banner.py`：
+
+```python
+import sys, re
+lines = re.split(r'\r?\n', sys.stdin.read())
+start = next((i for i, l in enumerate(lines) if re.match(r'^>\s*\[!WARNING\]', l)), -1)
+assert start >= 0, "没找到 WARNING 块"
+end = start
+while end + 1 < len(lines) and re.match(r'^>', lines[end + 1]):
+    end += 1
+# ★ 认特征串，不是「第一个 WARNING 块」
+assert '未经代码签名' in "\n".join(lines[start:end + 1]), "特征串不匹配，拒绝删除"
+while end + 1 < len(lines) and lines[end + 1].strip() == "":
+    end += 1
+kept = (lines[:start] if start else []) + (lines[end + 1:] if end + 1 < len(lines) else [])
+print("\n".join(kept))
+```
+
+★ **判定必须认「未经代码签名」这个特征串，不能认「第一个 `[!WARNING]` 块」**。正文后面
+还有两条给用户看的 `⚠️` 提示（SmartScreen 信誉积累、macOS 未公证的打开方式），认错了
+就会把它们一起删掉。`release.ps1` 的 `Remove-UnsignedBanner` 就是这么防的。
+
+**检查点**：改完确认 `未经代码签名` 出现 0 次，同时 `下载量积累起来的信誉` 与
+`未经 Apple 公证` 两句**仍在**。
 
 ⚠️ **只覆盖草稿 Release**。覆盖**已发布**的 Release 会让已下载用户的 sha256 对不上，且
 `release-published.yml` 早已按旧文件同步到 R2、那边的 `latest.json` 也指向旧 hash。
@@ -295,6 +332,38 @@ gh release edit "v$V" --notes-file /tmp/body.md
 
 **检查点**：`gh release view "v$V"` 确认 4 个 Windows 资产 + macOS `.pkg` 齐全。
 ⚠️ 少组件是静默的，数一遍。
+
+### 端到端验证：把文件真下回来验
+
+上传成功不等于挂上去的就是签名版 —— 真下回来比对才算数：
+
+```bash
+D=$(mktemp -d)
+gh release download "v$V" --pattern "WindInput-Setup-$V.exe" --dir "$D"
+gh release download "v$V" --pattern "WindInput-Portable-$V.zip" --dir "$D"
+for f in "WindInput-Setup-$V.exe" "WindInput-Portable-$V.zip"; do
+    r=$(sha256sum "$D/$f" | cut -d' ' -f1); l=$(sha256sum "dist/$f" | cut -d' ' -f1)
+    [ "$r" = "$l" ] && echo "  OK  $f" || echo "  ✗ $f 与本地签名版不一致!"
+done
+```
+
+★ **Linux 侧也能独立验签，不必依赖 signtool**：直接读 PE 的**证书表**（第 5 个数据
+目录），`size > 0` 即带签名。抽查便携包内每个 PE 尤其顺手 —— 解包后对每个 exe/dll：
+
+```python
+import struct, pathlib
+for p in sorted(pathlib.Path("解包目录").rglob("*")):
+    if p.suffix.lower() not in (".exe", ".dll"): continue
+    b = p.read_bytes()
+    opt = struct.unpack_from("<I", b, 0x3C)[0] + 24
+    magic = struct.unpack_from("<H", b, opt)[0]
+    dd = opt + (112 if magic == 0x20b else 96)     # PE32+ 与 PE32 的数据目录起点不同
+    rva, size = struct.unpack_from("<II", b, dd + 4 * 8)
+    print(p.name, size, "有签名" if size > 0 else "裸的")
+```
+
+⚠️ 它只证明「证书表非空」，证明不了签名有效、也看不出有无时间戳 —— 那两样仍要在
+Windows 侧 `signtool verify /pa /v`（见第 7 节）。两者互补，别拿这个替代那个。
 
 ---
 
