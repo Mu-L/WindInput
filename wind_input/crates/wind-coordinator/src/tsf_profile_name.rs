@@ -100,7 +100,22 @@ pub fn current_description() -> io::Result<Option<String>> {
 /// 只是退化回「重装冲掉别名」的老行为。故先写 `Description` 再写记录值。
 pub fn set_dota2_compat(enabled: bool, alias: &str) -> io::Result<bool> {
     let target = if enabled {
-        sanitize_alias(alias).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+        let t =
+            sanitize_alias(alias).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        // ⛔ 别名不能等于真实名。那样记录值里存的就是真实名，`Register.cpp` 的
+        // 「等于记录值就保留」恒成立 —— 当下无害（值本来就一样），但真实名将来一改
+        // （版本号、品牌、`TEXTSERVICE_NAME` 调整），profile 就被永久钉在旧名上且无提示。
+        // 何况「登记成自己的真名」正是**关闭**的语义，走开关即可。
+        if t == real_name() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "「{t}」是本输入法的真实名称，它不在游戏名单里；\
+                     要还原成它请直接关闭本开关"
+                ),
+            ));
+        }
+        t
     } else {
         real_name().to_string()
     };
@@ -119,6 +134,24 @@ pub fn set_dota2_compat(enabled: bool, alias: &str) -> io::Result<bool> {
     // 不补就永远补不上（幂等分支每次都提前 return），重装照样冲掉用户的别名。
     record_alias(enabled.then_some(target.as_str()))?;
     Ok(!unchanged)
+}
+
+/// 读回已登记的别名。没开兼容（或老版本装机）时回 `Ok(None)`。
+///
+/// 供 `system dota2-compat status` 展示：排查「升级后别名没了」时第一个要看的就是它
+/// ——`Register.cpp` 能不能在重装后认出用户的选择，全靠这个值在不在。
+pub fn recorded_alias() -> io::Result<Option<String>> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    match hklm.open_subkey_with_flags(app_key_path(), KEY_READ) {
+        Ok(key) => match key.get_value::<String, _>(ALIAS_VALUE) {
+            Ok(v) if !v.is_empty() => Ok(Some(v)),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// 写下（或清掉）「我们登记的别名」这条记录。

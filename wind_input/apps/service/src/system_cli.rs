@@ -24,7 +24,8 @@ const USAGE: &str = "\
       开启后语言栏与 Windows 设置里显示的名称会随之改变。
       写 HKLM，需管理员权限；改完需重启游戏才生效。
 
-      --name 省略时用出厂别名。名称含空格，shell 里要整体加引号。";
+      --name 省略时用出厂别名。名单里多数条目带空格，那时 shell 里要整体加引号。
+      可选名称的完整清单见 docs/design/game-compat-tsf-uielement.md §1.3。";
 
 /// 子命令入口。`args` 为 `system` 之后的参数。返回进程退出码。
 pub fn run(args: &[String]) -> i32 {
@@ -117,6 +118,14 @@ fn parse_name(rest: &[String]) -> Result<String, String> {
 
 fn dota2_status() -> i32 {
     println!("当前登记名称: {}", describe_current());
+    // ★ 记录值是「重装/升级后还认不认得出用户的选择」的唯一依据（见
+    // `tsf_profile_name::ALIAS_VALUE`）。排查「升级后别名没了」这类故障时第一个要看它，
+    // 不列出来就只能让人手动 reg query。
+    match tsf_profile_name::recorded_alias() {
+        Ok(Some(v)) => println!("已登记的兼容别名（重装后据此恢复）: {v}"),
+        Ok(None) => println!("已登记的兼容别名: （无——当前为关闭状态）"),
+        Err(e) => println!("已登记的兼容别名: （读取失败: {e}）"),
+    }
     println!(
         "出厂别名（--name 省略时用它）: {}",
         tsf_profile_name::DOTA2_ALIAS
