@@ -16,7 +16,7 @@ const USAGE: &str = "\
 动作:
   dota2-compat on [--name <名称>]   开启兼容（改本输入法在系统里登记的显示名）
   dota2-compat off                 关闭，还原为真实名称
-  dota2-compat status              显示当前登记的名称
+  dota2-compat status [--json]     显示当前登记的名称（--json 供程序读）
   help                             显示本帮助
 
 说明: Dota 2 按输入法名称查一张内置白名单决定要不要由游戏绘制候选，
@@ -47,7 +47,7 @@ fn dota2_compat(args: &[String]) -> i32 {
     let want = match args.first().map(String::as_str) {
         Some("on") => true,
         Some("off") => false,
-        Some("status") => return dota2_status(),
+        Some("status") => return dota2_status(&args[1..]),
         _ => {
             eprintln!("用法: wind_input system dota2-compat on|off|status");
             return 2;
@@ -116,7 +116,28 @@ fn parse_name(rest: &[String]) -> Result<String, String> {
     }
 }
 
-fn dota2_status() -> i32 {
+fn dota2_status(args: &[String]) -> i32 {
+    // --json：设置程序据此读回「系统里到底是什么」，用来播种落地判定的基线
+    // （见 tsf_profile_name::AliasStatus 的文档）。
+    // ⛔ 别让调用方去解析上面那段人话输出：它是中文的、随时会为可读性调整，
+    //    而这条链路一旦解析错，表现是「设置页显示的和系统里的不一样」且无人察觉。
+    if args.first().map(String::as_str) == Some("--json") {
+        let st = tsf_profile_name::AliasStatus::probe();
+        match serde_json::to_string(&st) {
+            Ok(j) => {
+                println!("{j}");
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("序列化状态失败: {e}");
+                return 1;
+            }
+        }
+    }
+    if let Some(other) = args.first() {
+        eprintln!("未知参数: {other}\n用法: wind_input system dota2-compat status [--json]");
+        return 2;
+    }
     println!("当前登记名称: {}", describe_current());
     // ★ 记录值是「重装/升级后还认不认得出用户的选择」的唯一依据（见
     // `tsf_profile_name::ALIAS_VALUE`）。排查「升级后别名没了」这类故障时第一个要看它，

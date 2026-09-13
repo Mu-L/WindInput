@@ -136,6 +136,62 @@ pub fn set_dota2_compat(enabled: bool, alias: &str) -> io::Result<bool> {
     Ok(!unchanged)
 }
 
+/// 系统侧的当前状态 —— 「注册表里到底是什么」的单一出口。
+///
+/// **为什么设置程序要读它**：设置页此前的基线全部来自 config.toml，从不看注册表，
+/// 于是两者一旦漂移就永远自愈不了 —— `base == now` 恒成立 ⇒ 不判脏 ⇒ 落地动作直接
+/// return，用户唯一的出路是「关掉再打开」两次 UAC，而界面没有任何提示说要这么做。
+/// 漂移来源不止一处：升级重注册、别的输入法、手工改注册表。
+///
+/// 设置程序跑在普通用户上下文，读 HKLM 不需要提权，故它经 `system dota2-compat
+/// status --json` 拿这份快照。⛔ 别让它自己去拼注册表路径 —— 那要把 CLSID/profile
+/// GUID 再抄一份，是新的漂移源。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AliasStatus {
+    /// TSF LanguageProfile 键在不在。反注册之后（升级过程中）它会整个消失。
+    pub registered: bool,
+    /// 当前登记的显示名。键不在或值读不出时为 `None`。
+    pub description: Option<String>,
+    /// 我们记下的别名。没开兼容、或老版本装机时为 `None`。
+    pub recorded: Option<String>,
+    /// 本输入法的真实显示名（随变体不同）。
+    pub real: String,
+    /// 出厂别名。
+    pub factory: String,
+}
+
+impl AliasStatus {
+    /// 从系统里取一份当前状态。读失败按「读不到」处理，不向上抛 —— 调用方要的是
+    /// 「系统现在是什么样」，而读不到本身就是一种回答（视同未启用）。
+    pub fn probe() -> Self {
+        Self {
+            registered: current_description().ok().flatten().is_some(),
+            description: current_description().ok().flatten(),
+            recorded: recorded_alias().ok().flatten(),
+            real: real_name().to_string(),
+            factory: DOTA2_ALIAS.to_string(),
+        }
+    }
+
+    /// 系统里此刻是不是「开着兼容」。判据是登记名不等于真实名 —— 与开关的语义一致。
+    pub fn enabled_now(&self) -> bool {
+        self.description
+            .as_deref()
+            .is_some_and(|d| d != self.real.as_str())
+    }
+
+    /// 系统里此刻用的是哪个别名。未启用时回 `None`。
+    ///
+    /// 优先取记录值：它是我们自己写的、跨重注册也在；`description` 只是回退，
+    /// 用于老装机（2026-09 之前开的兼容还没有记录值）。
+    pub fn alias_now(&self) -> Option<&str> {
+        if !self.enabled_now() {
+            return None;
+        }
+        self.recorded.as_deref().or(self.description.as_deref())
+    }
+}
+
 /// 读回已登记的别名。没开兼容（或老版本装机）时回 `Ok(None)`。
 ///
 /// 供 `system dota2-compat status` 展示：排查「升级后别名没了」时第一个要看的就是它
