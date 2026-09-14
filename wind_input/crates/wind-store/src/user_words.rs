@@ -1,15 +1,17 @@
 //! 用户词存储（redb）
 //!
 //! 与 Go 版本 `wind_input/internal/store/user_words.go` 对齐，但：
-//! - value 用定长 16 字节（weight i32 + count u32 + created_at i64），text/code 存于 key，比 Go 的 JSON 紧凑（store.md §7.3）。
+//! - value 用定长 28 字节（weight i32 + count u32 + created_at i64 + boundary u64 + order u32），
+//!   text/code 存于 key，比 Go 的 JSON 紧凑（store.md §7.3）。历经 16B→24B→28B 三版，
+//!   一路惰性升级免 migration，见 `dec_val_ordered`。
 //! - created_at 统一为 i64 unix 秒（修 Go user=秒/temp=毫秒 不一致，store.md §7.2）。
 //!
 //! key 编码：`"{schema}\0{code}\0{text}"`（store.md §2）。
 
 use crate::abbrev_index;
-use crate::store::{Store, USER_ABBREV, USER_WORDS};
+use crate::store::{Store, META, USER_ABBREV, USER_WORDS};
 use crate::wdict;
-use redb::ReadableTable;
+use redb::{ReadableTable, WriteTransaction};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +29,20 @@ pub struct UserWordRecord {
     /// `serde(default)`：v1 记录与旧客户端 JSON 无此字段，按 0 处理。
     #[serde(default)]
     pub boundary: u64,
+    /// 入库先后序号（见同模块的 `enc_val_ordered`，`pub(crate)` 故不做 intra-doc 链接）。
+    /// 同码等权时按它升序排，用来保住
+    /// 「导入文件里的词条先后」——对应 dict 侧二进制格式里的 `order` 字段（t80）。
+    ///
+    /// **0 = 无序号**：v1/v2 遗留记录，以及临时词库那些本就没有入库序号的来源。
+    ///
+    /// ⚠️ 0 是**最小值**，而 `better()` 按 `natural_order` **升序**排
+    /// （`wind-candidate/src/candidate.rs:873`）—— 所以无序号者排在**最前**，有序号的新词
+    /// 接在它们后面。这是刻意保留的现状：老库记录全是 0、彼此打平，次序一如既往。
+    /// （真正做 order 排序的是 `collect_user_word_rows` 与 `better()`；
+    /// `search_user_words_prefix` 不排序，它按 redb 的 key 字典序返回。）
+    /// `serde(default)`：v2 记录与旧客户端 JSON 无此字段，按 0 处理。
+    #[serde(default)]
+    pub order: u32,
 }
 
 /// 批量导入的分类计数(P2:added=新键 / updated=权重严格更大 / unchanged=权重≤现有不落盘)。
@@ -45,6 +61,38 @@ pub(crate) fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 用户词入库序号的发号器游标（存 META 表）。
+const NEXT_ORDER_KEY: &str = "user_words_next_order";
+
+/// 在**调用方的写事务内**领取 `n` 个连续的入库序号，返回起始号（含）。
+///
+/// # 为什么必须同事务
+///
+/// 号段与词条写入同属调用方那一个事务：回滚时号段一并作废，不会在序号轴上留下空洞；
+/// 提交后游标已推进，下一批必然更大 —— 于是「入库先后」与「序号大小」恒同序。
+/// 若改成自开事务先领号再写词，两者之间崩溃就会漏号，更糟的是并发两个导入可能拿到同一段。
+///
+/// # 为什么不扫表取 max+1
+///
+/// 那要求每次写入都全表扫一遍；用户词库上万条时代价不可接受，且并发下仍会撞号。
+///
+/// 序号从 **1** 起：0 被 `enc_val_ordered` 保留表示「无序号」（v1/v2 遗留记录）。
+///
+/// 游标用 `saturating_add` 封顶，全程无回绕、无负数、无 panic；到顶后新词一律拿同一个号，
+/// 退化成「新词之间无序」。⚠️ 但**推进速度不是「词条数」**：`import_user_words` 一次领满
+/// `rows.len()`，不管其中多少行只是更新 —— 所以游标吃掉的是**累计导入行数**。
+/// 一个一万条的词库反复导入约 43 万次即可耗尽 u32，虽仍属够不着，但别按「42 亿个词」去理解。
+pub(crate) fn take_word_orders(txn: &WriteTransaction, n: u32) -> anyhow::Result<u32> {
+    let mut t = txn.open_table(META)?;
+    let cur = t
+        .get(NEXT_ORDER_KEY)?
+        .and_then(|g| <[u8; 4]>::try_from(g.value()).ok())
+        .map(u32::from_le_bytes)
+        .unwrap_or(1);
+    t.insert(NEXT_ORDER_KEY, cur.saturating_add(n).to_le_bytes().as_slice())?;
+    Ok(cur)
+}
+
 /// key: "{schema}\0{code}\0{text}"
 pub(crate) fn enc_key(schema: &str, code: &str, text: &str) -> String {
     format!("{schema}\u{0}{code}\u{0}{text}")
@@ -60,6 +108,14 @@ pub(crate) fn split_key(key: &str) -> Option<(&str, &str, &str)> {
 ///
 /// v1 为 16 字节（无 boundary）。**惰性升级、无需 migration**：`dec_val` 按实际长度取值，
 /// 旧的 16B 记录读出 boundary=0（无边界信息，消费方降级回 DAG），下次写入时自然补齐为 24B。
+///
+/// ⚠️ **凡是写 `USER_WORDS` 表的路径一律不得用它**：写出的 24B 记录不含 `order`，会把该
+/// 词条既有的入库序号抹成「无」，于是它跳到该 code 下所有词之前 —— 且只在「用过一阵子」
+/// 后显形。本函数只给 `TEMP_WORDS`（临时词库本就没有入库序号）用。
+///
+/// ⚠️ **别按文件名去数写入点**：`temp_words.rs::promote_temp_word` 写的就是 `USER_WORDS`
+/// （晋升住在临时词模块里）。本次改动第一版正是漏了它 —— 而那处注释早写着同样的警告，
+/// 上一次栽的是简拼索引。
 pub(crate) fn enc_val(weight: i32, count: u32, created_at: i64, boundary: u64) -> [u8; 24] {
     let mut b = [0u8; 24];
     b[0..4].copy_from_slice(&weight.to_le_bytes());
@@ -69,11 +125,56 @@ pub(crate) fn enc_val(weight: i32, count: u32, created_at: i64, boundary: u64) -
     b
 }
 
+/// value(v3): 定长 28 字节 —— `weight i32 | count u32 | created_at i64 | boundary u64 | order u32`
+///
+/// `order` 是**入库先后序号**，由 [`take_word_orders`] 统一发号。同一个 code 下的多条
+/// 词条等权时按它升序排，于是「导入文件里的先后」得以保留。
+///
+/// # 为什么需要它（t80）
+///
+/// dict 侧的二进制格式本就带 `order u32`，`RankKey` 拿它做 weight 之后的二级键，所以文本
+/// 码表不写权重时，同码词条按**词库出现顺序**出。wdict 这边此前没有任何顺序字段：
+/// `record_to_candidate` 造候选时 `natural_order` 取 `Default`（恒 0），全部打平，`better()`
+/// 退化到按 `code → text` 字典序 —— 从别的平台迁词库过来，原有词序就这么丢了。
+///
+/// # 版本沿革与惰性升级
+///
+/// v1=16B（无 boundary）→ v2=24B → v3=28B（追加 order）。[`dec_val_ordered`] 按**实际长度**
+/// 取值，读不到的字段取 0，下次写入自然补齐 —— 与 v1→v2 那次同一条路，不需要 migration。
+/// `order = 0` 的语义是「没有序号」（v1/v2 旧库记录）。它**不做特殊处理**，原样进
+/// `Candidate::natural_order` 参与升序比较 —— 于是旧记录彼此保持现状（全 0、打平，
+/// 由 `better()` 的后续键 `code → text` 决定），新词（order ≥ 1）接在它们后面。
+/// 这是刻意选的最小改变：让旧记录改沉到队尾同样自洽，但会平白挪动所有老用户的既有词序。
+pub(crate) fn enc_val_ordered(
+    weight: i32,
+    count: u32,
+    created_at: i64,
+    boundary: u64,
+    order: u32,
+) -> [u8; 28] {
+    let mut b = [0u8; 28];
+    b[0..4].copy_from_slice(&weight.to_le_bytes());
+    b[4..8].copy_from_slice(&count.to_le_bytes());
+    b[8..16].copy_from_slice(&created_at.to_le_bytes());
+    b[16..24].copy_from_slice(&boundary.to_le_bytes());
+    b[24..28].copy_from_slice(&order.to_le_bytes());
+    b
+}
+
 /// 解码 value → (weight, count, created_at, boundary)
 ///
-/// 长度守卫刻意宽松（`< 16` 而非 `!= 24`）：旧 16B 记录仍能解出前三项，boundary 取 0。
-/// 直接切 `b[16..24]` 会在旧记录上越界，故必须按长度分支。
+/// [`dec_val_ordered`] 的薄壳，丢掉 order。给不关心顺序的调用方（`temp_words` /
+/// `abbrev_index`）用，免得它们为一个用不上的字段改 14 处解构。
 pub(crate) fn dec_val(b: &[u8]) -> Option<(i32, u32, i64, u64)> {
+    dec_val_ordered(b).map(|(w, c, ca, bd, _)| (w, c, ca, bd))
+}
+
+/// 解码 value → (weight, count, created_at, boundary, order)
+///
+/// 长度守卫刻意宽松（`< 16` 而非 `!= 28`）：v1 的 16B 记录仍能解出前三项，v2 的 24B 记录
+/// 再多解出 boundary。直接切 `b[16..24]` / `b[24..28]` 会在旧记录上越界，故必须按长度分支
+/// ——这是惰性升级免 migration 的前提，v1→v2 那次就是这么过来的。
+pub(crate) fn dec_val_ordered(b: &[u8]) -> Option<(i32, u32, i64, u64, u32)> {
     if b.len() < 16 {
         return None;
     }
@@ -82,11 +183,17 @@ pub(crate) fn dec_val(b: &[u8]) -> Option<(i32, u32, i64, u64)> {
     } else {
         0 // v1 遗留记录：无边界信息
     };
+    let order = if b.len() >= 28 {
+        u32::from_le_bytes(b[24..28].try_into().ok()?)
+    } else {
+        0 // v1/v2 遗留记录：无入库序号
+    };
     Some((
         i32::from_le_bytes(b[0..4].try_into().ok()?),
         u32::from_le_bytes(b[4..8].try_into().ok()?),
         i64::from_le_bytes(b[8..16].try_into().ok()?),
         boundary,
+        order,
     ))
 }
 
@@ -111,18 +218,24 @@ impl Store {
             let txn = db.begin_write()?;
             {
                 let mut t = txn.open_table(USER_WORDS)?;
-                let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
+                let existing = t.get(key.as_str())?.and_then(|g| dec_val_ordered(g.value()));
                 let (w, c, ca, b) = match existing {
-                    Some((ow, oc, oca, ob)) => {
+                    Some((ow, oc, oca, ob, _)) => {
                         (ow.max(weight), oc, oca, if ob != 0 { ob } else { boundary })
                     }
                     None => (weight, 0, now_secs(), boundary),
                 };
+                // 入库序号：已存在的原样保留（含 0 —— 旧库记录不补号，理由见 `enc_val_ordered`
+                // 的惰性升级一节：补了它们会拿到比所有新词更大的号，反而打乱既有词序）。
+                let order = match existing {
+                    Some((_, _, _, _, oo)) => oo,
+                    None => take_word_orders(&txn, 1)?,
+                };
                 // 边界可能从 0 被补齐（见上），索引键随之改变 → shift 负责删旧建新。
-                let old_b = existing.map(|(_, _, _, ob)| ob);
+                let old_b = existing.map(|(_, _, _, ob, _)| ob);
                 let mut idx = txn.open_table(USER_ABBREV)?;
                 abbrev_index::shift(&mut idx, schema, code, text, old_b, b)?;
-                t.insert(key.as_str(), enc_val(w, c, ca, b).as_slice())?;
+                t.insert(key.as_str(), enc_val_ordered(w, c, ca, b, order).as_slice())?;
             }
             txn.commit()?;
             Ok(())
@@ -143,7 +256,7 @@ impl Store {
                     break;
                 }
                 let text = &key[prefix.len()..];
-                if let Some((w, c, ca, b)) = dec_val(v.value()) {
+                if let Some((w, c, ca, b, o)) = dec_val_ordered(v.value()) {
                     out.push(UserWordRecord {
                         code: code.to_string(),
                         text: text.to_string(),
@@ -151,6 +264,7 @@ impl Store {
                         count: c,
                         created_at: ca,
                         boundary: b,
+                        order: o,
                     });
                 }
             }
@@ -176,8 +290,8 @@ impl Store {
                 if !key.starts_with(&scan) {
                     break;
                 }
-                if let (Some((_, code, text)), Some((w, c, ca, b))) =
-                    (split_key(key), dec_val(v.value()))
+                if let (Some((_, code, text)), Some((w, c, ca, b, o))) =
+                    (split_key(key), dec_val_ordered(v.value()))
                 {
                     out.push(UserWordRecord {
                         code: code.to_string(),
@@ -186,6 +300,7 @@ impl Store {
                         count: c,
                         created_at: ca,
                         boundary: b,
+                        order: o,
                     });
                 }
                 if limit > 0 && out.len() >= limit {
@@ -232,11 +347,11 @@ impl Store {
             let updated;
             {
                 let mut t = txn.open_table(USER_WORDS)?;
-                let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
+                let existing = t.get(key.as_str())?.and_then(|g| dec_val_ordered(g.value()));
                 match existing {
-                    // 仅改权重：boundary 沿用（切分与权重无关）。
-                    Some((_, c, ca, b)) => {
-                        t.insert(key.as_str(), enc_val(new_weight, c, ca, b).as_slice())?;
+                    // 仅改权重：boundary 与 order 均沿用（切分、入库先后都与权重无关）。
+                    Some((_, c, ca, b, o)) => {
+                        t.insert(key.as_str(), enc_val_ordered(new_weight, c, ca, b, o).as_slice())?;
                         updated = true;
                     }
                     None => updated = false,
@@ -263,16 +378,21 @@ impl Store {
             {
                 let mut t = txn.open_table(USER_WORDS)?;
                 // 不存在则创建 weight=0 记录（隐性造词路径）：此处只有扁平 code，无边界可算 → 0。
-                let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
+                let existing = t.get(key.as_str())?.and_then(|g| dec_val_ordered(g.value()));
                 let is_new = existing.is_none();
-                let (w, c, ca, b) = existing.unwrap_or((0, 0, now_secs(), 0));
+                // 本路径会凭空造词（见下），新词同样要领入库序号；已有的原样保留。
+                let order = match existing {
+                    Some((_, _, _, _, oo)) => oo,
+                    None => take_word_orders(&txn, 1)?,
+                };
+                let (w, c, ca, b, _) = existing.unwrap_or((0, 0, now_secs(), 0, 0));
                 let nc = c.saturating_add(1);
                 let nw = if count_threshold > 0 && nc % count_threshold == 0 {
                     w.saturating_add(boost_delta)
                 } else {
                     w
                 };
-                t.insert(key.as_str(), enc_val(nw, nc, ca, b).as_slice())?;
+                t.insert(key.as_str(), enc_val_ordered(nw, nc, ca, b, order).as_slice())?;
                 // ⚠️ **本路径会凭空造出用户词**（上面那句注释说的「隐性造词」），故必须建索引。
                 // 改权重不用动索引（value 空），但新增必须——漏了这一处，靠选词自动产生的
                 // 词就永远进不了简拼索引，且只在「用过一段时间后」才显形。
@@ -330,6 +450,12 @@ impl Store {
             {
                 let mut t = txn.open_table(USER_WORDS)?;
                 let mut idx = txn.open_table(USER_ABBREV)?;
+                // ★ t80 的正题：**一次领满号段**，按 `rows` 的行序依次发给新词条，于是
+                // 「词条在导入文件里的先后」= 「order 的大小」，同码等权时便按原文件顺序出。
+                // 逐条领号也对，但那要每条都开一次 META 表读写；万条词库时代价白费。
+                // 更新已有词条不消耗号，于是号段里会留下空洞 —— 无害，order 只比大小、
+                // 不要求连续。
+                let mut next_order = take_word_orders(&txn, rows.len() as u32)?;
                 for r in rows {
                     // code 列可能是带空格的音节码（`ni hao`）→ 拆成扁平 key + 边界。
                     // 无空格（五笔码/旧版导出）→ boundary=0，与改动前等价。
@@ -338,17 +464,19 @@ impl Store {
                     // join→split 会退化成 0），故导入闸口求解出的边界走 `WordIo::boundary`。
                     let in_b = r.boundary.unwrap_or(spaced_b);
                     let key = enc_key(schema, &code, &r.text);
-                    let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
+                    let existing = t.get(key.as_str())?.and_then(|g| dec_val_ordered(g.value()));
                     match existing {
                         None => {
                             t.insert(
                                 key.as_str(),
-                                enc_val(r.weight, r.count, now_secs(), in_b).as_slice(),
+                                enc_val_ordered(r.weight, r.count, now_secs(), in_b, next_order)
+                                    .as_slice(),
                             )?;
+                            next_order = next_order.saturating_add(1);
                             abbrev_index::insert(&mut idx, schema, &code, &r.text, in_b)?;
                             c.added += 1;
                         }
-                        Some((w, cnt, ca, b)) => {
+                        Some((w, cnt, ca, b, o)) => {
                             // weight/count 各取 max；boundary 旧值非 0 则沿用（同
                             // `add_user_word`：同 (schema,code,text) 的切分是确定的，
                             // 不因再次导入而变），旧值为 0 时用导入行补齐。
@@ -357,7 +485,11 @@ impl Store {
                             let nc = cnt.max(r.count);
                             let nb = if b != 0 { b } else { in_b };
                             if nw != w || nc != cnt || nb != b {
-                                t.insert(key.as_str(), enc_val(nw, nc, ca, nb).as_slice())?;
+                                // order 原样保留：再次导入同一个词不该把它挪到队尾。
+                                t.insert(
+                                    key.as_str(),
+                                    enc_val_ordered(nw, nc, ca, nb, o).as_slice(),
+                                )?;
                                 // 边界被补齐时索引键随之改变 → shift 删旧建新。
                                 if nb != b {
                                     abbrev_index::shift(
@@ -447,7 +579,12 @@ impl Store {
         &self,
         schema: &str,
     ) -> anyhow::Result<Vec<wdict::WordIo>> {
-        let recs = self.search_user_words_prefix(schema, "", 0)?;
+        let mut recs = self.search_user_words_prefix(schema, "", 0)?;
+        // 按入库序号导出，于是「导出 → 再导入」往返一圈词序不变（t80）——否则
+        // `search_user_words_prefix` 给的是 key 字典序，一次往返就把原有词序洗掉了。
+        // `sort_by_key` 是**稳定**排序：order 相同的（尤其全为 0 的旧库记录）保持
+        // 搜索给出的相对次序，不会因为导出而彼此重排。
+        recs.sort_by_key(|r| r.order);
         Ok(recs
             .into_iter()
             .map(|r| wdict::WordIo {
@@ -488,6 +625,220 @@ mod tests {
         let p = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    fn row(code: &str, text: &str) -> wdict::WordIo {
+        wdict::WordIo {
+            code: code.into(),
+            text: text.into(),
+            weight: 0,
+            count: 0,
+            boundary: None,
+        }
+    }
+
+    /// **同码词条按导入文件的先后出**（t80 的验收标准）。
+    ///
+    /// 三条词刻意按「甲 乙 丙」导入，而它们的 text 字典序恰好相反（丙 U+4E19 < 乙 U+4E59
+    /// < 甲 U+7532）—— 于是「按 order」与「按 text 字典序」两种结果可区分。缺陷期
+    /// `natural_order` 恒 0、redb 又按 key 字典序返回，拿到的就是「丙 乙 甲」。
+    ///
+    /// ⚠️ 光断言顺序不够：order 全为 0 时 `sort_by_key` 是稳定排序，会原样吐回 search 的
+    /// 次序，看着也可能"对"。故必须同时断言 order **严格递增且 ≥ 1**。
+    ///
+    /// 反向验证（2026-09-14 实跑）：删掉 `import_user_words` 里的
+    /// `next_order = next_order.saturating_add(1)` —— 所有新词拿同一个号 —— 本测试与
+    /// `word_order_survives_export_clear_import` 一起变红。
+    ///
+    /// ⚠️ 只把 `next_order` 的**初值**改成 0 是**无效变异**：`saturating_add` 照样让它
+    /// 递增成 0,1,2，顺序断言仍然通过，红的只是上面那句「order ≥ 1」。实测过，别照这条改。
+    #[test]
+    fn import_assigns_order_following_row_sequence() {
+        let p = tmp("wind_uw_order_import.redb");
+        let s = Store::open(&p).unwrap();
+        s.import_user_words("pinyin", &[row("abc", "甲"), row("abc", "乙"), row("abc", "丙")])
+            .unwrap();
+
+        let mut recs = s.get_user_words("pinyin", "abc").unwrap();
+        assert_eq!(recs.len(), 3);
+        recs.sort_by_key(|r| r.order);
+        let texts: Vec<&str> = recs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["甲", "乙", "丙"], "同码词条应按导入行序排");
+
+        let orders: Vec<u32> = recs.iter().map(|r| r.order).collect();
+        assert!(
+            orders[0] >= 1 && orders[0] < orders[1] && orders[1] < orders[2],
+            "order 应自 1 起严格递增（0 会被稳定排序掩盖成假通过），实际: {orders:?}"
+        );
+    }
+
+    /// 「导出 → 清空 → 再导入」一圈之后词序不变。
+    ///
+    /// 这是 t80 楼主的真实用法（迁词库 / 备份还原）。导出若按 key 字典序吐出，一次往返
+    /// 就把原有词序洗成字典序 —— 与缺陷期表现一模一样，且**更隐蔽**，因为库里明明存着
+    /// 正确的 order。
+    ///
+    /// 反向验证（2026-09-14 实跑）：删掉 `collect_user_word_rows` 里那句按 order 的排序，
+    /// 本测试即变红，另外三条不受影响。
+    #[test]
+    fn word_order_survives_export_clear_import() {
+        let p = tmp("wind_uw_order_roundtrip.redb");
+        let s = Store::open(&p).unwrap();
+        s.import_user_words("pinyin", &[row("abc", "甲"), row("abc", "乙"), row("abc", "丙")])
+            .unwrap();
+
+        let text = s.export_user_words_wdict("pinyin", "2026-09-14").unwrap();
+        s.clear_user_words("pinyin").unwrap();
+        s.import_user_words_wdict("pinyin", &text).unwrap();
+
+        let mut recs = s.get_user_words("pinyin", "abc").unwrap();
+        recs.sort_by_key(|r| r.order);
+        let texts: Vec<&str> = recs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["甲", "乙", "丙"], "一轮备份还原后词序应原样保留");
+    }
+
+    /// 再次导入同一批词**不得**把它们挪到队尾。
+    ///
+    /// 用户重复导入（或备份还原叠加导入）是常态。若更新路径也发新号，每导一次全库词序
+    /// 就被翻搅一次，且新号总比老号大 —— 表现为「越导越乱」。
+    ///
+    /// 反向验证（2026-09-14 实跑）：把更新分支的 `enc_val_ordered(nw, nc, ca, nb, o)` 的
+    /// `o` 换成 `next_order`（即更新也发新号），**只有本测试**变红 —— 另外三条都覆盖不到
+    /// 这个维度，故这一条不可省。
+    #[test]
+    fn reimport_keeps_existing_order() {
+        let p = tmp("wind_uw_order_reimport.redb");
+        let s = Store::open(&p).unwrap();
+        let rows = [row("abc", "甲"), row("abc", "乙")];
+        s.import_user_words("pinyin", &rows).unwrap();
+        let before: Vec<u32> = {
+            let mut r = s.get_user_words("pinyin", "abc").unwrap();
+            r.sort_by_key(|x| x.text.clone());
+            r.iter().map(|x| x.order).collect()
+        };
+
+        // 第二次导入：权重抬高以确保真的走了写盘分支（否则 unchanged 不写，测不到东西）。
+        let bumped: Vec<wdict::WordIo> = rows
+            .iter()
+            .map(|r| wdict::WordIo { weight: 900, ..r.clone() })
+            .collect();
+        s.import_user_words("pinyin", &bumped).unwrap();
+
+        let after: Vec<u32> = {
+            let mut r = s.get_user_words("pinyin", "abc").unwrap();
+            r.sort_by_key(|x| x.text.clone());
+            assert!(r.iter().all(|x| x.weight == 900), "前提：第二次导入应已写盘");
+            r.iter().map(|x| x.order).collect()
+        };
+        assert_eq!(before, after, "重复导入不得改变既有词条的入库序号");
+    }
+
+    /// 晋升临时词**不得**抹掉该词条在用户词表里的入库序号。
+    ///
+    /// `promote_temp_word` 住在 `temp_words.rs` 里，但它写的是 `USER_WORDS` —— 按文件名去数
+    /// 用户词的写入点必漏这一处（该函数的注释早写着这条警告，上一次栽的是简拼索引）。
+    /// 漏了它的后果不是「不生效」而是**越用越乱**：导入词条 order=10，被用户用熟晋升一次
+    /// 就被 24B 的 `enc_val` 写成 order=0，升序下 0 < 10，该词跳到这个 code 下所有词之前，
+    /// 且要「用过一阵子」才显形。
+    ///
+    /// 反向验证（2026-09-14 实跑）：把 `promote_temp_word` 的写入换回
+    /// `enc_val(nw, nc, nca, nb)`，本测试即变红。
+    #[test]
+    fn promote_temp_word_keeps_user_word_order() {
+        let p = tmp("wind_uw_order_promote.redb");
+        let s = Store::open(&p).unwrap();
+        s.import_user_words("pinyin", &[row("abc", "甲"), row("abc", "乙")])
+            .unwrap();
+        let pick = |st: &Store| -> UserWordRecord {
+            st.get_user_words("pinyin", "abc")
+                .unwrap()
+                .into_iter()
+                .find(|r| r.text == "乙")
+                .expect("「乙」应在用户词表里")
+        };
+        let before = pick(&s).order;
+        assert!(before >= 1, "前提：导入应已发号，实际 {before}");
+
+        // 用户词表里已有「乙」→ 晋升走 existing 分支（真实场景：导入的词后来被用熟）。
+        s.learn_temp_word("pinyin", "abc", "乙", 800, 0).unwrap();
+        assert!(
+            s.promote_temp_word("pinyin", "abc", "乙").unwrap(),
+            "前提：应晋升成功，否则测的是空路径"
+        );
+
+        assert_eq!(
+            pick(&s).order,
+            before,
+            "晋升不得改动既有入库序号（抹成 0 会把该词顶到所有导入词之前）"
+        );
+    }
+
+    /// 简拼召回的记录必须带**真实** order，否则表现为「全码对、简拼不对」。
+    ///
+    /// 缩写索引自己不定序，但它交出的记录经 `StoreUserLayer::search_abbrev` →
+    /// `record_to_candidate` → `sort_trunc`，而 `sort_trunc` 用的正是 `better()`，
+    /// `natural_order` 就在那条排序链上。硬编码 0 会让同一批词走全码时顺序正确、
+    /// 走简拼时退回 text 字典序。
+    ///
+    /// 反向验证（2026-09-14 实跑）：把 `abbrev_index::search` 里的 `order: o` 改回
+    /// `order: 0`，本测试即变红。
+    #[test]
+    fn abbrev_search_carries_real_order() {
+        let p = tmp("wind_uw_order_abbrev.redb");
+        let s = Store::open(&p).unwrap();
+        // 按「拟好 你好」导入；text 字典序恰好相反（你 U+4F60 < 拟 U+62DF），两者可区分。
+        s.import_user_words(
+            "pinyin",
+            &[row("ni hao", "拟好"), row("ni hao", "你好")],
+        )
+        .unwrap();
+
+        let mut recs = s.search_user_words_by_abbrev("pinyin", "nh", 0).unwrap();
+        assert_eq!(recs.len(), 2, "简拼 nh 应召回两条，实际 {recs:?}");
+        recs.sort_by_key(|r| r.order);
+        let texts: Vec<&str> = recs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["拟好", "你好"], "简拼召回应保住导入词序");
+
+        let orders: Vec<u32> = recs.iter().map(|r| r.order).collect();
+        assert!(
+            orders[0] >= 1 && orders[0] < orders[1],
+            "order 须为真值而非硬编码 0（全 0 时稳定排序会掩盖成假通过），实际 {orders:?}"
+        );
+    }
+
+    /// **向后兼容契约**：v2 的 24B 记录（无 order）读出 order=0，且不 panic。
+    ///
+    /// 与 `dec_val_reads_v1_16byte_records` 同理 —— 长度守卫必须分三档，直接切
+    /// `b[24..28]` 会在 v1/v2 记录上越界。
+    ///
+    /// 反向验证（2026-09-14 实跑）：去掉 `dec_val_ordered` 里 order 那档长度分支，
+    /// 本测试与 `dec_val_reads_v1_16byte_records` 一起变红（后者也红是对的：`dec_val`
+    /// 现在是 `dec_val_ordered` 的薄壳，两者共用同一条解码路径）。
+    #[test]
+    fn dec_val_ordered_reads_v1_and_v2_records() {
+        let mut v1 = [0u8; 16];
+        v1[0..4].copy_from_slice(&123i32.to_le_bytes());
+        assert_eq!(
+            dec_val_ordered(&v1).map(|t| (t.3, t.4)),
+            Some((0, 0)),
+            "v1（16B）：boundary 与 order 均取 0"
+        );
+
+        let v2 = enc_val(123, 7, 1_700_000_000, 0b101);
+        assert_eq!(v2.len(), 24);
+        assert_eq!(
+            dec_val_ordered(&v2),
+            Some((123, 7, 1_700_000_000, 0b101, 0)),
+            "v2（24B）：boundary 读回、order 取 0"
+        );
+
+        let v3 = enc_val_ordered(123, 7, 1_700_000_000, 0b101, 42);
+        assert_eq!(v3.len(), 28);
+        assert_eq!(dec_val_ordered(&v3), Some((123, 7, 1_700_000_000, 0b101, 42)));
+
+        // 薄壳与全量版对同一条记录必须给出一致的前四项。
+        assert_eq!(dec_val(&v3), Some((123, 7, 1_700_000_000, 0b101)));
+        assert_eq!(dec_val_ordered(&[0u8; 15]), None);
     }
 
     /// **备份还原不得丢音节边界**（本次改动的验收标准）。

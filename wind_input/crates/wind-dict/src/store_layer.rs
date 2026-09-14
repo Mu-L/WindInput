@@ -31,6 +31,15 @@ fn record_to_candidate(r: UserWordRecord, is_temp: bool, is_prefix: bool) -> Can
         weight: r.weight,
         boundary: r.boundary,
         is_prefix,
+        // 入库先后序号 → 候选的自然序（t80）。`better()` 的排序链是
+        // weight 降 → base_order 升 → **natural_order 升** → code → text：此前这里取
+        // `Default`（恒 0），同码等权的用户词全被打平，退化成按 text 字典序，于是从别的
+        // 平台迁进来的词库丢掉了原有词序。dict 侧本就用二进制格式里的 `order` 做这一档，
+        // 补上它两条路径才同口径。
+        //
+        // `min` 是防御性饱和：order 是 u32、natural_order 是 i32，真跑到 21 亿条也不会
+        // 折成负数（负数会让这些词跳到所有词前面，比无序更糟）。
+        natural_order: r.order.min(i32::MAX as u32) as i32,
         ..Default::default()
     };
     c.meta.raw_weight = r.weight;
@@ -90,6 +99,20 @@ impl DictLayer for StoreUserLayer {
         sort_trunc(cands, limit)
     }
 
+    /// ⚠️ **已知局限：`limit` 先截断、后排序**（t80 的已知边界，非本次引入）。
+    ///
+    /// `search_user_words_prefix` 按 redb 的 **key 字典序**扫，数够 `limit` 条就 `break`；
+    /// 随后 `sort_trunc` 才按 `better()`（含 `natural_order`）排。于是「该排第一但 key
+    /// 字典序靠后」的词条可能**压根没进这个列表**，order 再正确也救不回来。
+    ///
+    /// 举例：`abc` 前缀下有 60 个词，导入时排第 1 的那条其 key 字典序在第 55 位，
+    /// `limit = 30` ⇒ 它不在候选里。
+    ///
+    /// 改动前 `natural_order` 恒 0，截断只会漏掉低权重词，危害有限；补上 order 之后，
+    /// 这条局限会直接表现为「导入词序有时对、有时不对」。真要修得让截断也走排序口径
+    /// （堆选 top-k，或不截断后排），那会动到候选路径的性能与既有语义，不在 t80 的范围内。
+    ///
+    /// 导出路径不受影响：`collect_user_word_rows` 传的是 `limit = 0`（不截断）。
     fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate> {
         let recs = self
             .store

@@ -10,7 +10,7 @@
 
 use crate::abbrev_index;
 use crate::store::{Store, TEMP_ABBREV, TEMP_WORDS, USER_ABBREV, USER_WORDS};
-use crate::user_words::{UserWordRecord, dec_val, enc_key, enc_val, now_secs};
+use crate::user_words::{UserWordRecord, dec_val, enc_key, enc_val, enc_val_ordered, dec_val_ordered, now_secs};
 use crate::wdict;
 use redb::ReadableTable;
 
@@ -140,6 +140,8 @@ impl Store {
                         count: c,
                         created_at: ca,
                         boundary: b,
+                        // 临时词库不参与「导入文件词序」那套排序（它的顺序由造词先后与 count 决定）。
+                        order: 0,
                     });
                 }
             }
@@ -175,6 +177,8 @@ impl Store {
                         count: c,
                         created_at: ca,
                         boundary: b,
+                        // 临时词库不参与「导入文件词序」那套排序（它的顺序由造词先后与 count 决定）。
+                        order: 0,
                     });
                 }
                 if limit > 0 && out.len() >= limit {
@@ -384,18 +388,32 @@ impl Store {
                             let mut user_t = txn.open_table(USER_WORDS)?;
                             // boundary 随词一起晋升：临时词由造词算得（有边界），用户词侧若已有
                             // 非 0 值则沿用（同 code/text 的切分确定，且旧值来源未必更差）。
-                            let existing =
-                                user_t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
-                            let (nw, nc, nca, nb) = match existing {
-                                Some((uw, uc, uca, ub)) => (
+                            let existing = user_t
+                                .get(key.as_str())?
+                                .and_then(|g| dec_val_ordered(g.value()));
+                            // order：已在用户词表里的沿用原号，新晋升的领一个新号。
+                            // 不可用 24B 的 `enc_val` 写这里 —— 那会把导入词条既有的入库序号
+                            // 抹成 0，把它顶到该 code 下所有词之前，且「用过一阵子」才显形。
+                            let (nw, nc, nca, nb, no) = match existing {
+                                Some((uw, uc, uca, ub, uo)) => (
                                     uw.max(PROMOTED_WEIGHT),
                                     tc + uc,
                                     uca,
                                     if ub != 0 { ub } else { tb },
+                                    uo,
                                 ),
-                                None => (PROMOTED_WEIGHT, tc, tca, tb),
+                                None => (
+                                    PROMOTED_WEIGHT,
+                                    tc,
+                                    tca,
+                                    tb,
+                                    crate::user_words::take_word_orders(&txn, 1)?,
+                                ),
                             };
-                            user_t.insert(key.as_str(), enc_val(nw, nc, nca, nb).as_slice())?;
+                            user_t.insert(
+                                key.as_str(),
+                                enc_val_ordered(nw, nc, nca, nb, no).as_slice(),
+                            )?;
                             // ⚠️ **本文件里唯一写用户词表的路径**。按文件名去数用户词的写路径
                             // 必漏这一处——晋升住在临时词模块里。漏了它，自动学习晋升上来的词
                             // 就永远进不了简拼索引，且要「用一段时间后」才显形。
@@ -404,7 +422,7 @@ impl Store {
                                 schema,
                                 code,
                                 text,
-                                existing.map(|(_, _, _, ub)| ub),
+                                existing.map(|(_, _, _, ub, _)| ub),
                                 nb,
                             )?;
                         }

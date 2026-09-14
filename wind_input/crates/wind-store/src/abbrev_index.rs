@@ -26,7 +26,7 @@
 //! 必然紧跟对应的 `abbrev_index::*` 调用。
 
 use crate::store::{TEMP_ABBREV, TEMP_WORDS, USER_ABBREV, USER_WORDS};
-use crate::user_words::{UserWordRecord, dec_val, enc_key, split_key};
+use crate::user_words::{UserWordRecord, dec_val, dec_val_ordered, enc_key, split_key};
 use redb::{ReadableTable, ReadableTableMetadata, Table, TableDefinition, WriteTransaction};
 
 /// 按音节边界取各音节首字母（`nihao` + `0b101` → `nh`）。
@@ -207,9 +207,9 @@ pub(crate) fn search(
                 continue;
             };
             // 回主表取权重与边界：索引 value 刻意留空，故这里点查一次。
-            let Some((w, c, ca, b)) = main
+            let Some((w, c, ca, b, o)) = main
                 .get(enc_key(schema, code, text).as_str())?
-                .and_then(|g| dec_val(g.value()))
+                .and_then(|g| dec_val_ordered(g.value()))
             else {
                 continue; // 主表已无 → 孤儿索引，跳过（不该发生，防御性）
             };
@@ -220,6 +220,13 @@ pub(crate) fn search(
                 count: c,
                 created_at: ca,
                 boundary: b,
+                // ⚠️ 这里**必须**带上真实 order。索引本身不定序，但它交出的记录经
+                // `StoreUserLayer::search_abbrev` → `record_to_candidate` → `sort_trunc`，
+                // 而 `sort_trunc` 用的正是 `better()`，`natural_order` 就在那条排序链里。
+                // 硬编码 0 的后果：导入的 `ni hao → 你好/拟好` 打全码 `nihao` 顺序正确，
+                // 走简拼 `nh` 却退回字典序 —— 表现为「全码对、简拼不对」。
+                // 主表 value 就在手上（上面那次点查），换 `dec_val_ordered` 零额外开销。
+                order: o,
             });
             if limit > 0 && out.len() >= limit {
                 return Ok(out);
