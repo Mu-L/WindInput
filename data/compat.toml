@@ -67,6 +67,26 @@
 #                         开启后这类请求不再采纳，中文状态保持不变。
 #                         Ctrl+Space 不受影响（按住 Ctrl 时一律放行），仍可正常切中英。
 #                         用户层同名规则若未写本字段会继承出厂值；显式 false 才关闭。
+#   host_drawn_candidates:
+#                         宿主自己画候选时收起我们的候选框：不写=自动判定（默认）｜
+#                         false=无论探测到什么都照弹我们的框。
+#                         自动判定有两条来源：宿主**声明**接管（TSF 规范里的 UI-less，
+#                         全屏游戏 / SDL、Unreal 等引擎），以及宿主没声明、却把候选串
+#                         **读走了**（传统 IMM32 宿主经系统桥接取候选自己画，老网游多是
+#                         这一类）。本字段只管后面那条——前面那条是宿主明说的，照弹就是
+#                         两头画，不给关。
+#                         ⚠ 什么时候需要改成 false：判定依据是「读了就是在画」，而读候选
+#                         串的**不一定**都在画（读屏软件也读）。万一误判，现象是**两个候选
+#                         框都没有**、完全不能用——给这个应用写一行 false 即可恢复。
+#                         若是所有应用都没了候选框（多半是某个常驻工具在读），
+#                         用 process = "*" 写一条通配规则一次全关：
+#                             [[apps]]
+#                             process = "*"
+#                             host_drawn_candidates = false
+#                         通配只对本字段生效，不会把别的字段也套到所有应用上；
+#                         本进程自己的规则优先于通配。
+#                         写 true 与不写等价（都是自动判定），本字段是单向关闭开关。
+#                         用户层同名规则若未写本字段会继承出厂值；显式 false 才关闭。
 #   caret_offset_x:       光标坐标水平校正（dp，96dpi 基准逻辑像素，正=右，默认 0）。
 #   caret_offset_y:       光标坐标垂直校正（dp，96dpi 基准逻辑像素，正=下，默认 0）。
 #                         用于宿主报告的光标坐标**系统性偏移**的场景（如 Windows Terminal，
@@ -80,8 +100,8 @@
 # first_show_mode / initial_mode / initial_punct / auto_pair / candidate_position_mode /
 # ignore_host_ime_close 对应右键菜单：「应用独立配置（<进程名>）」子菜单，各自单选。
 # （菜单切换会写入用户层 compat.toml，不改本文件）
-# smart_method、caret_offset_* 与 candidate_x/y 不进菜单：前两者按需手工编辑用户层
-# compat.toml，候选框位置由拖动候选框设定。
+# smart_method、caret_offset_*、host_drawn_candidates 与 candidate_x/y 不进菜单：
+# 前三者按需手工编辑用户层 compat.toml，候选框位置由拖动候选框设定。
 #
 # ⚠ initial_mode / initial_punct 的语义是「初始值」而不是「锁定」：
 #   - 每次焦点**从别的应用**切进来时套用一次；停留在本应用期间用户可自由手动切换，

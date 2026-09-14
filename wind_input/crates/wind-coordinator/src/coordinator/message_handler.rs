@@ -3560,8 +3560,8 @@ impl MessageHandler for Coordinator {
     }
 
     // ── TSF UI-less（宿主自绘候选）三件套，实现见 handle_uielement.rs ──
-    fn handle_uielement_state(&self, pid: u32, host_draws: bool) {
-        self.set_uielement_host_draws(pid, host_draws);
+    fn handle_uielement_state(&self, pid: u32, host_draws: bool, host_reads: bool) {
+        self.apply_uielement_state(pid, host_draws, host_reads);
     }
 
     fn uielement_page(&self) -> wind_ipc::protocol::UiElementPage {

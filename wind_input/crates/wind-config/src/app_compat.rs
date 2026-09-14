@@ -417,6 +417,37 @@ pub struct AppCompatRule {
     /// 服务端不去猜。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_host_ime_close: Option<bool>,
+    /// 宿主自绘候选时收起我们自己的候选窗；`None` = 自动判定（默认），`Some(false)` =
+    /// 无论探测到什么都照弹我们的窗。
+    ///
+    /// ⚠ `Some(true)` 与 `None` **行为完全一致**（都是「自动判定」），本字段实际是个单向
+    /// 关闭开关。之所以仍用 `Option<bool>` 而不是裸 `bool`：`#[serde(default)]` 下的 bool
+    /// 会让所有未配置的应用都拿到 `false`，等于给全世界关掉了这个判定（理由同
+    /// `initial_mode`）。要让 `true` 长出「无条件收窗」这层独立语义的话，得先有一条
+    /// 「宿主在画但从不来读」的实测宿主，目前没有。
+    ///
+    /// 自动判定有两条来源，语气不同：
+    /// - 宿主**声明**接管（`BeginUIElement` 回 `pbShow=FALSE` / UI-less 线程）——这是事实，
+    ///   本开关**管不着**它：宿主明说了不要我们的 UI，照弹就是两头画。
+    /// - 宿主没声明、却把候选串**读走了**（`UIELEMENT_FLAG_HOST_READS`）——这是推断，
+    ///   本开关管的就是它。
+    ///
+    /// ⚠ 为什么推断那条需要一个逃生口：已知的读取者是 CUAS 的 IMM32 桥（传统宿主经
+    /// `ImmGetCandidateList` 取候选自己画），但**读候选串的不一定都在画**——读屏软件
+    /// 同样订阅 TSF UI 元素并读候选串来朗读。真误判时用户看到的是「两个候选框都没了」，
+    /// 那是彻底不能用；给一行 compat 就能自救。
+    ///
+    /// 2026-09-11 新枫之谷（`maplestory.exe`）实测：日志里 7 个宿主只有它读过候选串，
+    /// 但另外 6 个当时**一次候选都没出过**（核心日志里 `UpdateCandidates` 全部记在
+    /// maplestory 名下）⇒ 构不成负对照，**这一条至今没有反证样本**，属于「先按推断走、
+    /// 留逃生口」的取舍。收到「候选框完全消失」的反馈时，判据先看这里。
+    ///
+    /// 逃生口有两层：本进程名一条，以及 `process = "*"` 的通配一条（后者是故障半径的
+    /// 配套——若某个常驻工具普遍触发误判，用户面对的是「所有应用都没候选框了」，
+    /// 那时不该只有逐个 exe 枚举这一条路）。查表见
+    /// `Coordinator::uielement_host_draws_by_inference`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_drawn_candidates: Option<bool>,
 }
 
 fn is_zero_i32(v: &i32) -> bool {
@@ -931,6 +962,8 @@ struct ProtocolFields {
     /// 配上之后，用户层若已有该进程的稀疏规则（比如只配过 `initial_mode`），不登记就会
     /// 把出厂值整条吞掉——`pin_anchor_when_start_drifts` 2026-09-05 正是这么白测一轮的。
     ignore_host_ime_close: Option<bool>,
+    /// 「这个宿主自己画候选」是宿主 TSF 行为形态，不是用户偏好 ⇒ 属于本组。
+    host_drawn_candidates: Option<bool>,
 }
 
 impl ProtocolFields {
@@ -939,6 +972,7 @@ impl ProtocolFields {
             composition_start_pair_guard: rule.composition_start_pair_guard,
             pin_anchor_when_start_drifts: rule.pin_anchor_when_start_drifts,
             ignore_host_ime_close: rule.ignore_host_ime_close,
+            host_drawn_candidates: rule.host_drawn_candidates,
         }
     }
 
@@ -952,6 +986,9 @@ impl ProtocolFields {
         }
         if rule.ignore_host_ime_close.is_none() {
             rule.ignore_host_ime_close = self.ignore_host_ime_close;
+        }
+        if rule.host_drawn_candidates.is_none() {
+            rule.host_drawn_candidates = self.host_drawn_candidates;
         }
     }
 }
@@ -1329,6 +1366,7 @@ mod tests {
             "composition_start_pair_guard",
             "pin_anchor_when_start_drifts",
             "ignore_host_ime_close",
+            "host_drawn_candidates",
         ];
         for f in HOST_PROTOCOL_FIELDS {
             assert!(

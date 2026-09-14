@@ -1707,6 +1707,9 @@ pub struct Coordinator {
     /// 接管了候选绘制的宿主进程（TSF UI-less / `pbShow=FALSE`），按 pid 记账。
     /// 焦点落在其中任一进程时不弹本地候选窗。写入见 `handle_uielement.rs`。
     pub(crate) uielement_host_pids: Mutex<std::collections::HashSet<u32>>,
+    /// 实际读走过候选串的进程（`UIELEMENT_FLAG_HOST_READS`）。与上面那张分开：
+    /// 那是宿主的声明，这是推断，只有这张受 compat `host_drawn_candidates` 管。
+    pub(crate) uielement_reader_pids: Mutex<std::collections::HashSet<u32>>,
     /// 「当前在输入的进程」：焦点/激活事件与**每个按键**都会写它（bridge 按管道对端 pid）。
     /// 与 `active_compat.pid` 的区别：那份只由焦点/激活事件维护，而游戏这类宿主常常没有
     /// 可编辑 TSF 上下文、`focus_gained` 一次都不来——按键才是「谁在输入」的最强证据
@@ -2433,6 +2436,7 @@ impl Coordinator {
             fullscreen_probing: std::sync::atomic::AtomicBool::new(false),
             fullscreen_exclusive_cached: std::sync::atomic::AtomicBool::new(false),
             uielement_host_pids: Mutex::new(std::collections::HashSet::new()),
+            uielement_reader_pids: Mutex::new(std::collections::HashSet::new()),
             focus_pid: std::sync::atomic::AtomicU32::new(0),
             #[cfg(windows)]
             host_render: std::sync::OnceLock::new(),

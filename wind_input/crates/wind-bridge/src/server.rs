@@ -911,7 +911,7 @@ pub(crate) fn dispatch_command(
         // 与 focus/activation 那些事件用的 client_token 高 32 位同一口径，消费端按它记账。
         CMD_UIELEMENT_STATE => {
             if let Ok(st) = decode_uielement_state(payload) {
-                handler.handle_uielement_state(st.pid, st.host_draws());
+                handler.handle_uielement_state(st.pid, st.host_draws(), st.host_reads());
             }
             if is_async { None } else { Some(encode_ack()) }
         }
@@ -1227,11 +1227,11 @@ mod tests {
         fn handle_candidate_scroll(&self, delta: i32) {
             self.last_scroll.store(delta, Ordering::SeqCst);
         }
-        fn handle_uielement_state(&self, pid: u32, host_draws: bool) {
+        fn handle_uielement_state(&self, pid: u32, host_draws: bool, host_reads: bool) {
             self.last_uielement
                 .lock()
                 .unwrap()
-                .push(format!("state:{pid}:{host_draws}"));
+                .push(format!("state:{pid}:{host_draws}:{host_reads}"));
         }
         fn uielement_page(&self) -> UiElementPage {
             UiElementPage {
@@ -1282,7 +1282,28 @@ mod tests {
         assert!(dispatch_for_test(&dyn_handler, CMD_UIELEMENT_STATE, true, &[1, 2], ctx).is_none());
         assert_eq!(
             *handler.last_uielement.lock().unwrap(),
-            vec!["state:99:true".to_string(), "action:1:3".to_string()]
+            vec!["state:99:true:false".to_string(), "action:1:3".to_string()]
+        );
+
+        // 只置读取位：声明位必须仍为 false——合并成一位就没法只关掉推断那一半。
+        let reads_only = UiElementStatePayload {
+            pid: 77,
+            flags: wind_ipc::protocol::UIELEMENT_FLAG_HOST_READS,
+        };
+        assert!(
+            dispatch_for_test(
+                &dyn_handler,
+                CMD_UIELEMENT_STATE,
+                true,
+                &reads_only.to_bytes(),
+                ctx
+            )
+            .is_none()
+        );
+        assert_eq!(
+            handler.last_uielement.lock().unwrap().last().unwrap(),
+            "state:77:false:true",
+            "HOST_READS 不得被当成 host_draws——那样 compat 覆盖就失去了作用对象"
         );
 
         let frame = dispatch_for_test(&dyn_handler, CMD_UIELEMENT_QUERY, false, &[], ctx)

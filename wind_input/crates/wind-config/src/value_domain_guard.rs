@@ -208,6 +208,7 @@ fn app_compat_seed() -> toml::Value {
         pin_anchor_when_start_drifts: Some(true),
         candidate_position_mode: Some(CandidatePositionMode::Fixed),
         ignore_host_ime_close: Some(true),
+        host_drawn_candidates: Some(true),
         ..Default::default()
     };
     let file = AppCompatFile {

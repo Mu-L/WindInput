@@ -960,6 +960,8 @@ CTextService::CTextService()
     , _uiLessThread(FALSE)
     , _uiElementStateSent(-1)
     , _uiUpdatedFlags(0)
+    , _uiSnapshotDirty(FALSE)
+    , _uiHostReadsCandidates(FALSE)
     , _pSourceSingle(nullptr)
     , _funcProviderRegistered(FALSE)
     , _hHotkeyWnd(nullptr)
@@ -1327,8 +1329,11 @@ STDAPI CTextService::Deactivate()
     // 清理候选 UI 元素（必须在 ThreadMgr 释放之前）
     NotifyCandidatesVisibilityChanged(FALSE);
     // UI-less 记账归零：下次 ActivateEx 重新问宿主、重新报服务端。
+    // 读取闩一并清掉——pid 会被系统复用，留着它会让下一个宿主一上来就被判成自绘。
     _uiHostDraws = FALSE;
+    _uiHostReadsCandidates = FALSE;
     _uiSnapshot = UiElementSnapshot();
+    _uiSnapshotDirty = FALSE;
     _uiElementStateSent = -1;
 
     // Unregister layout sink and edit sink
@@ -2237,6 +2242,7 @@ STDAPI CTextService::IsShown(BOOL* pbShow)
 STDAPI CTextService::GetUpdatedFlags(DWORD* pdwFlags)
 {
     if (pdwFlags == nullptr) return E_INVALIDARG;
+    _EnsureUiSnapshotFresh();
     *pdwFlags = _UiElementUseSnapshot() ? _uiUpdatedFlags : kUiElementAllFlags;
     WIND_LOG_DEBUG_FMT(L"UIElement host read: GetUpdatedFlags=0x%X snapshot=%d count=%u\n",
                        *pdwFlags, (int)_UiElementUseSnapshot(),
@@ -2263,6 +2269,7 @@ STDAPI CTextService::GetDocumentMgr(ITfDocumentMgr** ppdim)
 STDAPI CTextService::GetCount(UINT* puCount)
 {
     if (puCount == nullptr) return E_INVALIDARG;
+    _EnsureUiSnapshotFresh();
     // 无快照且宿主不接管时给占位 1：至少 1 个候选才能让 TSF 认为候选 UI "有意义"（Chromium 调度所需）。
     *puCount = _UiElementUseSnapshot() ? (UINT)_uiSnapshot.items.size() : 1;
     return S_OK;
@@ -2271,6 +2278,7 @@ STDAPI CTextService::GetCount(UINT* puCount)
 STDAPI CTextService::GetSelection(UINT* puIndex)
 {
     if (puIndex == nullptr) return E_INVALIDARG;
+    _EnsureUiSnapshotFresh();
     if (!_UiElementUseSnapshot())
     {
         *puIndex = 0;
@@ -2288,6 +2296,7 @@ STDAPI CTextService::GetSelection(UINT* puIndex)
 STDAPI CTextService::GetString(UINT uIndex, BSTR* pstr)
 {
     if (pstr == nullptr) return E_INVALIDARG;
+    _EnsureUiSnapshotFresh(TRUE); // ★ 取内容：闩未合上时也要补拉，否则首次读到的是上一帧
     if (!_UiElementUseSnapshot())
     {
         *pstr = SysAllocString(L"…"); // 占位
@@ -2301,12 +2310,16 @@ STDAPI CTextService::GetString(UINT uIndex, BSTR* pstr)
     const std::wstring& text = _uiSnapshot.items[uIndex];
     *pstr = SysAllocStringLen(text.c_str(), (UINT)text.size());
     WIND_LOG_DEBUG_FMT(L"UIElement host read: GetString(%u)=\"%s\"\n", uIndex, text.c_str());
+    // ★ 判定点：把真实候选串交出去了。GetCount / GetUpdatedFlags 这类元信息 msctf 自己
+    // 也会问，不足以说明有人要画；**取走文本**才是。占位分支（上面那个早退）不打闩。
+    _NoteHostReadCandidates();
     return *pstr ? S_OK : E_OUTOFMEMORY;
 }
 
 STDAPI CTextService::GetPageIndex(UINT* pIndex, UINT uSize, UINT* puPageCnt)
 {
     if (puPageCnt == nullptr) return E_INVALIDARG;
+    _EnsureUiSnapshotFresh();
     if (!_UiElementUseSnapshot())
     {
         *puPageCnt = 1;
@@ -2342,6 +2355,7 @@ STDAPI CTextService::SetPageIndex(UINT* pIndex, UINT uPageCnt)
 STDAPI CTextService::GetCurrentPage(UINT* puPage)
 {
     if (puPage == nullptr) return E_INVALIDARG;
+    _EnsureUiSnapshotFresh();
     *puPage = _UiElementUseSnapshot() ? _uiSnapshot.currentPage : 0;
     return S_OK;
 }
@@ -2417,8 +2431,11 @@ STDAPI CTextService::FinalizeExactCompositionString(void)
 void CTextService::_ReportUiElementState()
 {
     uint32_t flags = 0;
-    if (_UiElementHostDraws()) flags |= UIELEMENT_FLAG_HOST_DRAWS;
+    // ⚠ HOST_DRAWS 只报**声明**，不带上读取闩：声明是事实、读取是推断，core 要能分开
+    // 记账（推断那条可被 compat 规则关掉）。合并成一位就没法只关掉推断的那一半。
+    if (_uiHostDraws) flags |= UIELEMENT_FLAG_HOST_DRAWS;
     if (_uiLessThread) flags |= UIELEMENT_FLAG_UI_LESS_THREAD;
+    if (_uiHostReadsCandidates) flags |= UIELEMENT_FLAG_HOST_READS;
     if ((int32_t)flags == _uiElementStateSent) return;
     if (_pIPCClient == nullptr || !_pIPCClient->IsConnected()) return; // 未连上：留着 -1，下次再报
     UiElementStatePayload payload = {};
@@ -2427,13 +2444,17 @@ void CTextService::_ReportUiElementState()
     if (_pIPCClient->SendAsync(CMD_UIELEMENT_STATE, &payload, sizeof(payload)))
     {
         _uiElementStateSent = (int32_t)flags;
-        WIND_LOG_INFO_FMT(L"uielement state reported: flags=0x%X (host_draws=%d ui_less=%d)\n",
-                          flags, (int)_UiElementHostDraws(), (int)_uiLessThread);
+        WIND_LOG_INFO_FMT(L"uielement state reported: flags=0x%X (host_draws=%d ui_less=%d host_reads=%d)\n",
+                          flags, (int)_uiHostDraws, (int)_uiLessThread,
+                          (int)_uiHostReadsCandidates);
     }
 }
 
 BOOL CTextService::_RefreshUiElementSnapshot()
 {
+    // 无论拉成功还是失败，快照都已按「当前能拿到的最新」重算过一次，不再是过期的。
+    // 失败时留着 dirty 只会让后续每个 getter 都重试一次同步 IPC，把宿主 UI 线程拖死。
+    _uiSnapshotDirty = FALSE;
     if (_pIPCClient == nullptr) return FALSE;
     ServiceResponse resp;
     if (!_pIPCClient->SendSync(CMD_UIELEMENT_QUERY, nullptr, 0, resp)
@@ -2468,6 +2489,34 @@ void CTextService::_UpdateUiElementForHost()
     if (_pUIElementMgr == nullptr || _uiElementId == (DWORD)-1) return;
     _RefreshUiElementSnapshot();
     _pUIElementMgr->UpdateUIElement(_uiElementId);
+}
+
+void CTextService::_EnsureUiSnapshotFresh(BOOL contentRead)
+{
+    // ⚠ 这是本类唯一一处在 **msctf 的 sink 派发栈内**发生的同步 IPC（UpdateUIElement →
+    // 宿主 GetString → 这里），最坏会把宿主 UI 线程按住 READ_TIMEOUT_MS（1500ms），
+    // 期间进程内其它 sink / TIP 一并挂起。两点让它可以接受：
+    //   1. **每次激活至多发生一次**——它只在「脏且尚未合闩」时成立，而这一次调用
+    //      必然合上闩（见 GetString），此后第三分支走 _UpdateUiElementForHost() 急刷，
+    //      dirty 恒为 FALSE，getter 再也不会走到这里；
+    //   2. 真跑满 1500ms 只可能是服务端挂死，那时输入法整体已不可用，不是本路径独有。
+    // ⛔ 不要为此调小超时：读超时与 _RecordFailure/Disconnect/熔断是同一套（见
+    // IPCClient.h 的 IPCConfig 注释——「超时过短会把偶发慢误判为服务挂死而断连」），
+    // 调小换来的是负载高时误断 IPC + 熔断 3 秒，比顿一下更糟。
+    if (!_uiSnapshotDirty) return;
+    // 还没认定有人在读时，只有「取内容」那一次值得一趟同步 IPC——别的 getter 可能只是
+    // msctf 自己在探问（见头文件里这个参数的说明）。
+    if (!contentRead && !_uiHostReadsCandidates) return;
+    _RefreshUiElementSnapshot();
+}
+
+void CTextService::_NoteHostReadCandidates()
+{
+    if (_uiHostReadsCandidates) return;
+    _uiHostReadsCandidates = TRUE;
+    WIND_LOG_INFO(L"uielement: 宿主实际读取了候选串（pbShow=TRUE 却来读）——判定为宿主自绘，"
+                  L"服务端将收起本进程的候选窗\n");
+    _ReportUiElementState();
 }
 
 void CTextService::_SendUiElementAction(uint32_t action, uint32_t arg)
@@ -2518,12 +2567,16 @@ void CTextService::NotifyCandidatesVisibilityChanged(BOOL hasCandidates)
             _uiHostDraws = !bShow;
             WIND_LOG_DEBUG_FMT(L"BeginUIElement ok id=%u show=%d\n", _uiElementId, (int)bShow);
             _ReportUiElementState();
-            if (_UiElementHostDraws())
-            {
-                // 规范：回 FALSE 后必须 UpdateUIElement（快照已在 Begin 前取好，首次全位置位）。
-                _uiUpdatedFlags = kUiElementAllFlags;
-                _pUIElementMgr->UpdateUIElement(_uiElementId);
-            }
+            // 规范：回 FALSE 后**必须** UpdateUIElement（快照已在 Begin 前取好，首次全位置位）。
+            // 回 TRUE 时规范说可不调——这里仍然调，为的是**把会读的宿主逼出来**：
+            // IMM32 桥只在收到 UpdateUIElement 之后才来读（新枫之谷实测：Begin 之后静默
+            // 1.3s 不读，第二键的 Update 一到立刻读满 9 条）。不在首键就给它这次机会，
+            // 读取闩要等到第二键才合上，而我们自己的候选窗在首显闸门（25~600ms）里早已
+            // 弹出来了——用户看到的就是「先两个框、再收掉一个」。
+            // 代价：不读的宿主每次组合起手多一次 UpdateUIElement，它们不会因此拉快照
+            // （getter 不被调用 ⇒ _EnsureUiSnapshotFresh 不触发），键路径零额外 IPC。
+            _uiUpdatedFlags = kUiElementAllFlags;
+            _pUIElementMgr->UpdateUIElement(_uiElementId);
         }
         else
         {
@@ -2541,6 +2594,7 @@ void CTextService::NotifyCandidatesVisibilityChanged(BOOL hasCandidates)
         // BeginUIElement 会重新问；服务端那边的记账也照旧，避免每次组合结束都收/弹一次。
         _uiSnapshot = UiElementSnapshot();
         _uiUpdatedFlags = 0;
+        _uiSnapshotDirty = FALSE;
     }
     else if (hasCandidates && _uiElementId != (DWORD)-1)
     {
@@ -2550,7 +2604,12 @@ void CTextService::NotifyCandidatesVisibilityChanged(BOOL hasCandidates)
         }
         else
         {
-            // 已注册，仅触发 update
+            // 还不知道有没有人在读：**只记账不拉取**，通知照发。宿主真来读 getter 时
+            // 由 _EnsureUiSnapshotFresh 补拉，届时拿到的就是当前候选。
+            // ⛔ 别改成无条件 _UpdateUiElementForHost()：那是给每个宿主的每一次按键
+            // 都加一次宿主 UI 线程上的同步 IPC（读超时 1500ms），代价落在所有人身上，
+            // 而真正需要它的只有会读的那一小撮。
+            _uiSnapshotDirty = TRUE;
             _pUIElementMgr->UpdateUIElement(_uiElementId);
         }
     }

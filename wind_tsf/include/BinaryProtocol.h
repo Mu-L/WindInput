@@ -747,6 +747,11 @@ static_assert(sizeof(InputStateReportPayload) == 14, "InputStateReportPayload mu
 // UIElement state (C++ -> core, async). flags 位定义同 Rust UIELEMENT_FLAG_*。
 constexpr uint32_t UIELEMENT_FLAG_HOST_DRAWS     = 0x0001; // 宿主接管绘制（pbShow=FALSE / Show(FALSE)）
 constexpr uint32_t UIELEMENT_FLAG_UI_LESS_THREAD = 0x0002; // 线程以 TF_TMAE_UIELEMENTENABLEDONLY 激活
+// 宿主**没有**声明接管（pbShow=TRUE），却实际来读了候选串（ITfCandidateListUIElement::
+// GetString）。已知的读取者是 CUAS 的 IMM32 桥：传统宿主经 ImmGetCandidateList 取候选、
+// 由宿主或 DefWindowProc 画出旧版候选窗——于是屏幕上两个候选框。声明位与本位分开报，
+// 因为「声明自绘」是事实、「读了就是在画」是推断，core 那边要能分别记账、分别覆盖。
+constexpr uint32_t UIELEMENT_FLAG_HOST_READS     = 0x0004; // 宿主实际读取了候选串
 struct UiElementStatePayload
 {
     uint32_t pid;   // GetCurrentProcessId()

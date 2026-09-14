@@ -27,6 +27,14 @@
 //! 设计与外部规范摘要见 `docs/design/game-compat-tsf-uielement.md`。
 
 use crate::coordinator::{Coordinator, State};
+use std::sync::Mutex;
+
+/// compat 里表示「所有应用」的进程名，目前只被 `host_drawn_candidates` 的回落查表认。
+///
+/// ⛔ 刻意**不**做成 `AppCompat::get_rule` 的通用通配：那会让 `process = "*"` 的一条规则
+/// 把全部字段（初始中英、首显档、定位方式……）一次性套到每个应用头上，是个比本次要解决
+/// 的问题大得多的语义变更。这里只给「推断收窗」这一条判据留一个全局关闭口。
+pub(crate) const HOST_DRAWN_WILDCARD: &str = "*";
 use tracing::{debug, info};
 use wind_ipc::protocol::{
     UIELEMENT_ACTION_ABORT, UIELEMENT_ACTION_FINALIZE, UIELEMENT_ACTION_SET_PAGE,
@@ -34,30 +42,72 @@ use wind_ipc::protocol::{
 };
 
 impl Coordinator {
-    /// 记录某进程是否接管候选绘制。`host_draws=false` 即撤销（宿主 `Show(TRUE)` / 结束）。
-    pub(crate) fn set_uielement_host_draws(&self, pid: u32, host_draws: bool) {
+    /// 消费一次 DLL 的 `CMD_UIELEMENT_STATE`：**两张账一起写完，再统一刷一次 UI**。
+    ///
+    /// ⚠ 别拆成两次带副作用的写入。DLL 报的是一整份 flags，拆开写会在过渡态露出半截
+    /// 状态：宿主从「声明接管」转成「只是读过」（`Show(TRUE)` 之后闩仍在）时，先写完
+    /// 声明账那一刻两张账都不命中，`notify_ui_update` 会把候选窗弹出来一帧，等第二张账
+    /// 写完才收回去——用户看到候选窗闪一下。
+    pub(crate) fn apply_uielement_state(&self, pid: u32, host_draws: bool, host_reads: bool) {
         if pid == 0 {
             return;
         }
-        let changed = {
-            let mut set = self
-                .uielement_host_pids
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if host_draws {
-                set.insert(pid)
-            } else {
-                set.remove(&pid)
-            }
-        };
-        if changed {
-            let name = self.cached_proc_name((pid as u64) << 32);
-            info!("uielement: pid={pid} name={name:?} host_draws={host_draws}（宿主接管候选绘制）");
-            // 状态翻转要立刻体现：接管时收掉已弹出的窗（首次组合的应答先于本报告到达），
-            // 撤销时把候选重新弹出来。
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            self.notify_ui_update(&state);
+        let draws_changed = self.record_uielement_pid(&self.uielement_host_pids, pid, host_draws);
+        let reads_changed = self.record_uielement_pid(&self.uielement_reader_pids, pid, host_reads);
+        if !draws_changed && !reads_changed {
+            return;
         }
+        let name = self.cached_proc_name((pid as u64) << 32);
+        info!("uielement: pid={pid} name={name:?} host_draws={host_draws} host_reads={host_reads}");
+        // 状态翻转要立刻体现：判定自绘时收掉已弹出的窗（首次组合的应答先于本报告到达），
+        // 撤销时把候选重新弹出来。
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.notify_ui_update(&state);
+    }
+
+    /// 往一张 pid 账里写一笔，回「这一笔是否改变了集合」。**不**碰 UI——通知由调用方
+    /// 在两张账都写完之后统一发一次（见 [`Self::apply_uielement_state`]）。
+    fn record_uielement_pid(
+        &self,
+        account: &Mutex<std::collections::HashSet<u32>>,
+        pid: u32,
+        member: bool,
+    ) -> bool {
+        let mut set = account.lock().unwrap_or_else(|e| e.into_inner());
+        if member {
+            set.insert(pid)
+        } else {
+            set.remove(&pid)
+        }
+    }
+
+    /// 记录某进程是否接管候选绘制。`host_draws=false` 即撤销（宿主 `Show(TRUE)` / 结束）。
+    /// 只改声明账，读取账原样保留。
+    ///
+    /// 生产路径走 [`Self::apply_uielement_state`]（DLL 一份 flags 一次写完）；本方法留给
+    /// 测试单独驱动一张账，故 `cfg(test)`。
+    #[cfg(test)]
+    pub(crate) fn set_uielement_host_draws(&self, pid: u32, host_draws: bool) {
+        let reads = self
+            .uielement_reader_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&pid);
+        self.apply_uielement_state(pid, host_draws, reads);
+    }
+
+    /// 记录某进程**实际读走过候选串**（`UIELEMENT_FLAG_HOST_READS`）。
+    ///
+    /// 与 [`Self::set_uielement_host_draws`] 分成两张账：那张是宿主的声明，这张是推断，
+    /// 只有这张受 compat 规则 `host_drawn_candidates` 管。同样只给测试用。
+    #[cfg(test)]
+    pub(crate) fn set_uielement_host_reads(&self, pid: u32, host_reads: bool) {
+        let draws = self
+            .uielement_host_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&pid);
+        self.apply_uielement_state(pid, draws, host_reads);
     }
 
     /// 进程退出/切走本输入法时清账。pid 复用时残留条目会让新进程首次候选被压一帧
@@ -71,8 +121,15 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&pid);
-        if removed {
-            debug!("uielement: pid={pid} 清账");
+        // 两张账一起清：读取账留着更危险——pid 复用后新宿主会被直接判成自绘，
+        // 而它自己的首次 GetString 不一定会发生，没人来纠正。
+        let reader_removed = self
+            .uielement_reader_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&pid);
+        if removed || reader_removed {
+            debug!("uielement: pid={pid} 清账 (draws={removed} reads={reader_removed})");
         }
     }
 
@@ -85,16 +142,84 @@ impl Coordinator {
             .uielement_host_pids
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        self.current_pid_in(&set).is_some()
+    }
+
+    /// 当前在输入的进程是否**读走过**我们的候选串（推断它在自绘）。取 pid 的口径同上。
+    /// 生产判据用 [`Self::uielement_host_draws_by_inference`]（它还要查 compat 覆盖）。
+    #[cfg(test)]
+    pub(crate) fn uielement_host_reads(&self) -> bool {
+        self.uielement_reader_pid().is_some()
+    }
+
+    /// 同上，但回**命中的那个 pid**——查 compat 覆盖时必须用它，不能另取一次，见
+    /// [`Self::uielement_host_draws_by_inference`]。
+    fn uielement_reader_pid(&self) -> Option<u32> {
+        let set = self
+            .uielement_reader_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.current_pid_in(&set)
+    }
+
+    /// 「当前在输入的进程」在给定 pid 集合里的话，是哪一个。两张 UIElement 账共用同一
+    /// 口径，免得一张改了另一张没改。
+    ///
+    /// ⚠ 回的是 `Option<u32>` 而不是 `bool`：命中可能来自 `focus_pid`（按键来源）也可能
+    /// 来自 `active_compat.pid`（焦点事件），**两者在游戏宿主上会分岔**——游戏常常没有
+    /// 可编辑 TSF 上下文、`focus_gained` 一次都不来，`active_compat` 会停在上一个进程
+    /// （既有测试 `key_source_pid_alone_matches_host_draws` 就钉的这个）。谁命中就得用谁
+    /// 去查进程名，否则覆盖规则会落到别的进程头上。
+    fn current_pid_in(&self, set: &std::collections::HashSet<u32>) -> Option<u32> {
         if set.is_empty() {
-            return false;
+            return None;
         }
         let key_pid = self.focus_pid.load(std::sync::atomic::Ordering::Relaxed);
+        if key_pid != 0 && set.contains(&key_pid) {
+            return Some(key_pid);
+        }
         let compat_pid = self
             .active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pid;
-        (key_pid != 0 && set.contains(&key_pid)) || (compat_pid != 0 && set.contains(&compat_pid))
+        if compat_pid != 0 && set.contains(&compat_pid) {
+            return Some(compat_pid);
+        }
+        None
+    }
+
+    /// 推断那条判据：宿主读走了候选串，**且**没在 compat 里被显式关掉。
+    ///
+    /// 查名用**命中的那个 pid**（见 [`Self::current_pid_in`]）：不能图省事走
+    /// `active_process_name()`，它只认 `active_compat.pid`，而游戏宿主恰恰常常靠
+    /// `focus_pid` 才命中——那样写的话，用户给游戏配的逃生口会静默失效，而误判的表现
+    /// 是「两个候选框都没了」，等于把兜底也押上。
+    ///
+    /// 覆盖查两层：先查本进程名，再回落到通配规则 `process = "*"`。后者是**故障半径的
+    /// 配套**——推断若在某一类宿主上普遍误判（例如某个常驻的读屏/辅助工具在读候选串），
+    /// 用户面对的是「所有应用的候选框都没了」，这时不该只有逐个 exe 枚举这一条路。
+    ///
+    /// 查不到进程名时按默认（收窗）走——名字查不到多半是宿主受限/短命进程，那恰恰是更
+    /// 需要「别在人家画面上弹窗」的一类；此时通配规则仍然生效，全局逃生口不受影响。
+    pub(crate) fn uielement_host_draws_by_inference(&self) -> bool {
+        let Some(pid) = self.uielement_reader_pid() else {
+            return false;
+        };
+        let name = self.cached_proc_name((pid as u64) << 32);
+        let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
+        let by_process = if name.is_empty() {
+            None
+        } else {
+            table.get_rule(&name).and_then(|r| r.host_drawn_candidates)
+        };
+        by_process
+            .or_else(|| {
+                table
+                    .get_rule(HOST_DRAWN_WILDCARD)
+                    .and_then(|r| r.host_drawn_candidates)
+            })
+            .unwrap_or(true)
     }
 
     /// 本进程的浮窗（候选窗 / 状态气泡 / 工具栏）是否该被压住。返回原因（供日志），
@@ -120,10 +245,25 @@ impl Coordinator {
     /// Covering 的那一键弹了窗、把游戏踢出独占 → 黑屏 → 游戏重抢独占 → 下一键又判独占……
     /// **反馈环 = 持续跳黑屏卡死**。按 host_draws 无条件压窗后，独占判据抖不抖都不弹，环断开。
     ///
-    /// 两条都**不设配置键**：都是可由程序判定的物理事实，按 config-design-rules R1 处理。
+    /// **判据三：宿主没声明、却把候选串读走了**（`UIELEMENT_FLAG_HOST_READS`）—— 已知的
+    /// 读取者是 CUAS 的 IMM32 桥：传统宿主经 `ImmGetCandidateList` 取候选，由宿主或
+    /// `DefWindowProc` 画出旧版候选窗。2026-09-11 新枫之谷实测就是这个形态——屏幕上两个
+    /// 候选框，且游戏画的那个停在第一个码的候选上。读了就是在画，我们不必再画第二份；
+    /// 宿主画的那个还贴着它自己的输入框（位置由它的 `ImmSetCandidateWindow` 决定），
+    /// 比我们在全屏游戏里靠 caret 猜的位置准。
+    ///
+    /// ⚠ 判据一二是**事实**（宿主声明 / 物理独占），判据三是**推断**——读候选串的不一定
+    /// 都在画（读屏软件也读）。故只有它可经 compat 规则 `host_drawn_candidates = false`
+    /// 逐宿主关掉，见 [`Self::uielement_host_draws_by_inference`]。这正是 config-design-rules
+    /// R1 说的「可由程序判定 ⇒ 自动判定 + compat 覆盖，不加用户键」。
+    ///
+    /// 判据一二**不设任何覆盖**：都是可由程序判定的物理事实，按 R1 处理。
     pub(crate) fn ui_suppressed_by_host(&self) -> Option<&'static str> {
         if self.uielement_host_draws() {
             return Some("uielement_host_draws");
+        }
+        if self.uielement_host_draws_by_inference() {
+            return Some("uielement_host_reads");
         }
         if self
             .fullscreen_exclusive_cached
@@ -341,6 +481,244 @@ mod tests {
             c.notify_ui_update(&st);
         }
         assert!(drain(&rx).contains(&"update"), "撤销接管应把候选弹回来");
+    }
+
+    /// 把进程名登记进 `pid_names`，让 `active_process_name()` 查得到（compat 覆盖要用）。
+    fn name_pid(c: &Coordinator, pid: u32, name: &str) {
+        c.pid_names.lock().unwrap().insert(pid, name.to_string());
+    }
+
+    /// 装一份只含一条规则的 compat 表。
+    fn compat_rule(c: &Coordinator, rule: wind_config::app_compat::AppCompatRule) {
+        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(vec![rule]);
+    }
+
+    /// 宿主没声明接管（`pbShow=TRUE`）却把候选串读走了 ⇒ 判定它在自绘，收掉我们的窗。
+    ///
+    /// 2026-09-11 新枫之谷实测形态：CUAS 的 IMM32 桥替宿主读走候选、由宿主/DefWindowProc
+    /// 画出旧版候选窗，屏幕上两个框。宿主画的那个贴着它自己的输入框，位置比我们靠 caret
+    /// 猜的准（全屏游戏根本给不出 caret），所以该退的是我们。
+    #[test]
+    fn a_host_that_reads_our_candidates_is_treated_as_drawing_them() {
+        let (c, rx) = coord();
+        fill(&c, 5);
+        focus_pid(&c, 42);
+        name_pid(&c, 42, "maplestory.exe");
+
+        c.set_uielement_host_reads(42, true);
+        assert!(!c.uielement_host_draws(), "它并没有声明接管——两张账不能混");
+        assert_eq!(
+            c.ui_suppressed_by_host(),
+            Some("uielement_host_reads"),
+            "读走候选串即判定自绘"
+        );
+        let _ = drain(&rx);
+        {
+            let st = c.state.lock().unwrap();
+            c.notify_ui_update(&st);
+        }
+        let got = drain(&rx);
+        assert!(
+            got.contains(&"hide") && !got.contains(&"update"),
+            "判定自绘后只发 Hide: {got:?}"
+        );
+    }
+
+    /// compat 的 `host_drawn_candidates = false` 只关掉**推断**那条，我们的窗照弹。
+    ///
+    /// 这是推断误判时的唯一自救口——读候选串的不一定都在画（读屏软件也读），
+    /// 误判的表现是「两个候选框都没了」，彻底不能用。
+    #[test]
+    fn compat_can_turn_off_the_inference_but_not_the_declaration() {
+        let (c, rx) = coord();
+        fill(&c, 5);
+        focus_pid(&c, 42);
+        name_pid(&c, 42, "maplestory.exe");
+        compat_rule(
+            &c,
+            wind_config::app_compat::AppCompatRule {
+                process: "MapleStory.exe".into(), // 大小写无关
+                host_drawn_candidates: Some(false),
+                ..Default::default()
+            },
+        );
+
+        c.set_uielement_host_reads(42, true);
+        assert_eq!(
+            c.ui_suppressed_by_host(),
+            None,
+            "显式关掉推断后照弹我们的窗"
+        );
+        let _ = drain(&rx);
+        {
+            let st = c.state.lock().unwrap();
+            c.notify_ui_update(&st);
+        }
+        assert!(drain(&rx).contains(&"update"), "关掉推断后候选窗必须回来");
+
+        // 但宿主**声明**接管时，本开关管不着：宿主明说了不要我们的 UI。
+        c.set_uielement_host_draws(42, true);
+        assert_eq!(
+            c.ui_suppressed_by_host(),
+            Some("uielement_host_draws"),
+            "声明是事实，不受 host_drawn_candidates 影响"
+        );
+    }
+
+    /// ★★★ 逃生口必须对「靠按键来源才命中的宿主」生效——而那正是游戏宿主的常态。
+    ///
+    /// `focus_pid`（按键来源）与 `active_compat.pid`（焦点事件）在游戏上会分岔：游戏常常
+    /// 没有可编辑 TSF 上下文、`focus_gained` 一次都不来，`active_compat` 停在上一个进程
+    /// （既有测试 `key_source_pid_alone_matches_host_draws` 钉的就是这个）。
+    /// 查覆盖时若另取一次 `active_compat.pid`，查到的是**上一个进程**的名字：
+    /// 用户给游戏配的逃生口静默失效，而误判的表现是「两个候选框都没了」。
+    #[test]
+    fn the_escape_hatch_works_when_only_the_key_source_pid_identifies_the_host() {
+        let (c, _rx) = coord();
+        fill(&c, 5);
+        focus_pid(&c, 1); // 焦点事件停在上一个进程
+        name_pid(&c, 1, "explorer.exe");
+        c.focus_pid.store(42, std::sync::atomic::Ordering::Relaxed); // 按键来源才是游戏
+        name_pid(&c, 42, "maplestory.exe");
+        compat_rule(
+            &c,
+            wind_config::app_compat::AppCompatRule {
+                process: "MapleStory.exe".into(),
+                host_drawn_candidates: Some(false),
+                ..Default::default()
+            },
+        );
+
+        c.set_uielement_host_reads(42, true);
+        assert_eq!(
+            c.ui_suppressed_by_host(),
+            None,
+            "逃生口必须落到真正在输入的那个进程上，不能另取一次 active_compat.pid"
+        );
+    }
+
+    /// 通配规则 `process = "*"` 一行关掉全局推断——推断若在某一类宿主上普遍误判，
+    /// 用户不该只有逐个 exe 枚举这一条路。
+    #[test]
+    fn a_wildcard_rule_turns_the_inference_off_everywhere() {
+        let (c, _rx) = coord();
+        fill(&c, 5);
+        focus_pid(&c, 42);
+        name_pid(&c, 42, "some-unknown-host.exe");
+        compat_rule(
+            &c,
+            wind_config::app_compat::AppCompatRule {
+                process: crate::handle_uielement::HOST_DRAWN_WILDCARD.into(),
+                host_drawn_candidates: Some(false),
+                ..Default::default()
+            },
+        );
+        c.set_uielement_host_reads(42, true);
+        assert_eq!(c.ui_suppressed_by_host(), None, "通配规则应关掉推断");
+
+        // 本进程自己的规则优先于通配：通配关、本进程显式开 ⇒ 照收窗。
+        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(vec![
+            wind_config::app_compat::AppCompatRule {
+                process: crate::handle_uielement::HOST_DRAWN_WILDCARD.into(),
+                host_drawn_candidates: Some(false),
+                ..Default::default()
+            },
+            wind_config::app_compat::AppCompatRule {
+                process: "some-unknown-host.exe".into(),
+                host_drawn_candidates: Some(true),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(
+            c.ui_suppressed_by_host(),
+            Some("uielement_host_reads"),
+            "本进程规则应压过通配"
+        );
+    }
+
+    /// 查不到进程名时按默认（收窗）走，但**通配逃生口仍然管用**——否则受限/短命宿主
+    /// 上就彻底没有退路了。
+    #[test]
+    fn an_unnamed_process_still_honours_the_wildcard_escape_hatch() {
+        let (c, _rx) = coord();
+        fill(&c, 5);
+        focus_pid(&c, 42); // 不登记 pid_names
+        c.set_uielement_host_reads(42, true);
+        assert_eq!(
+            c.ui_suppressed_by_host(),
+            Some("uielement_host_reads"),
+            "查不到名字时默认收窗"
+        );
+        compat_rule(
+            &c,
+            wind_config::app_compat::AppCompatRule {
+                process: crate::handle_uielement::HOST_DRAWN_WILDCARD.into(),
+                host_drawn_candidates: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.ui_suppressed_by_host(), None, "通配对无名进程也要生效");
+    }
+
+    /// 「声明接管」→「只是读过」的过渡不得把候选窗闪出来一帧。
+    ///
+    /// DLL 报的是一整份 flags，两张账必须写完再统一刷 UI；拆成两次带副作用的写入时，
+    /// 声明账先被清掉的那一瞬两张账都不命中，`notify_ui_update` 会发一帧 `UpdateCandidates`。
+    #[test]
+    fn the_draws_to_reads_transition_does_not_flash_the_window() {
+        let (c, rx) = coord();
+        fill(&c, 5);
+        focus_pid(&c, 42);
+        name_pid(&c, 42, "maplestory.exe");
+        // ⚠ 必须从「只有声明账」起步：若先报过一次 draws+reads，读取账里已经有这个 pid，
+        // 拆开写也不会露出空窗，测试就成了永远绿的。可达路径是中间那次 0x5 上报丢了
+        // （SendAsync 失败会留着 _uiElementStateSent 下次重报），core 直接收到 0x4。
+        c.apply_uielement_state(42, true, false); // 只声明接管
+        let _ = drain(&rx);
+        c.apply_uielement_state(42, false, true); // 一步转成「只是读过」
+        let got = drain(&rx);
+        assert!(
+            !got.contains(&"update"),
+            "过渡期间不得弹出候选窗（哪怕只有一帧）: {got:?}"
+        );
+        assert_eq!(
+            c.ui_suppressed_by_host(),
+            Some("uielement_host_reads"),
+            "撤销声明后仍由推断接手收窗"
+        );
+    }
+
+    /// 读取账按 pid 记，只对「当前在输入的进程」生效——游戏读过，切到记事本仍要弹。
+    #[test]
+    fn the_reader_account_only_applies_to_the_process_being_typed_in() {
+        let (c, _rx) = coord();
+        fill(&c, 3);
+        focus_pid(&c, 42);
+        name_pid(&c, 42, "maplestory.exe");
+        c.set_uielement_host_reads(7, true); // 别的进程读过
+        assert_eq!(c.ui_suppressed_by_host(), None, "焦点在 42，未命中 7");
+        focus_pid(&c, 7);
+        name_pid(&c, 7, "maplestory.exe");
+        assert_eq!(c.ui_suppressed_by_host(), Some("uielement_host_reads"));
+    }
+
+    /// 进程退出清账必须把**两张**账一起清：读取账留着，pid 复用后新宿主会一上来就被
+    /// 判成自绘，而它自己的 GetString 不一定会发生，没人来纠正。
+    #[test]
+    fn clearing_a_pid_clears_the_reader_account_too() {
+        let (c, _rx) = coord();
+        fill(&c, 3);
+        focus_pid(&c, 42);
+        name_pid(&c, 42, "maplestory.exe");
+        c.set_uielement_host_draws(42, true);
+        c.set_uielement_host_reads(42, true);
+        c.clear_uielement_host_pid(42);
+        assert!(!c.uielement_host_draws(), "声明账未清");
+        assert!(
+            !c.uielement_host_reads(),
+            "读取账未清——pid 复用后会误判新宿主"
+        );
+        assert_eq!(c.ui_suppressed_by_host(), None);
     }
 
     /// D3D 独占全屏缓存位单独就能压住候选窗；无边框全屏（仅 fullscreen_cached）不压。

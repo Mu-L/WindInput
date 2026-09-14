@@ -210,8 +210,10 @@ impl MessageHandler for DeferredHandler {
     }
 
     /// UIElement 三件套。同上：不转发则宿主自绘的游戏永远拿不到候选、我们的窗也照弹。
-    fn handle_uielement_state(&self, pid: u32, host_draws: bool) {
-        self.with_handler((), |h| h.handle_uielement_state(pid, host_draws))
+    fn handle_uielement_state(&self, pid: u32, host_draws: bool, host_reads: bool) {
+        self.with_handler((), |h| {
+            h.handle_uielement_state(pid, host_draws, host_reads)
+        })
     }
 
     fn note_key_source_pid(&self, pid: u32) {
@@ -235,44 +237,69 @@ mod tests {
     /// 记录被转发到的方法，供转发完整性断言。
     #[derive(Default)]
     struct Recorder {
-        calls: Mutex<Vec<&'static str>>,
+        calls: Mutex<Vec<String>>,
     }
 
     impl Recorder {
-        fn got(&self, name: &'static str) -> bool {
-            self.calls.lock().unwrap().contains(&name)
+        /// 前缀匹配：带参数的记录（如 `uielement_state:7:true:false`）用调用名即可命中。
+        fn got(&self, name: &str) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == name || c.starts_with(&format!("{name}:")))
         }
     }
 
     impl MessageHandler for Recorder {
         // ── 被测方法：记录是否收到转发 ──
         fn handle_english_stats(&self, _c: u32, _d: u32, _p: u32, _s: u32) {
-            self.calls.lock().unwrap().push("english_stats");
+            self.calls.lock().unwrap().push("english_stats".to_string());
         }
         fn handle_input_state_report(&self, _pid: u32, _dis: bool, _r: u8, _m: u64) {
-            self.calls.lock().unwrap().push("input_state_report");
+            self.calls
+                .lock()
+                .unwrap()
+                .push("input_state_report".to_string());
         }
         fn handle_diag_snapshot(&self, _s: &DiagSnapshotPayload) {
-            self.calls.lock().unwrap().push("diag_snapshot");
+            self.calls.lock().unwrap().push("diag_snapshot".to_string());
         }
         fn handle_client_connected(&self, _pid: u32) {
-            self.calls.lock().unwrap().push("client_connected");
+            self.calls
+                .lock()
+                .unwrap()
+                .push("client_connected".to_string());
         }
-        fn handle_uielement_state(&self, _pid: u32, _host_draws: bool) {
-            self.calls.lock().unwrap().push("uielement_state");
+        fn handle_uielement_state(&self, pid: u32, host_draws: bool, host_reads: bool) {
+            // ⚠ 参数要进记录：只 push 一个固定字符串的话，DeferredHandler 把 host_reads
+            // 丢掉也不会让任何测试变红（与 server.rs 的记录器同款做法）。
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("uielement_state:{pid}:{host_draws}:{host_reads}"));
         }
         fn note_key_source_pid(&self, _pid: u32) {
-            self.calls.lock().unwrap().push("key_source_pid");
+            self.calls
+                .lock()
+                .unwrap()
+                .push("key_source_pid".to_string());
         }
         fn uielement_page(&self) -> UiElementPage {
-            self.calls.lock().unwrap().push("uielement_page");
+            self.calls
+                .lock()
+                .unwrap()
+                .push("uielement_page".to_string());
             UiElementPage {
                 items: vec!["x".into()],
                 ..Default::default()
             }
         }
         fn handle_uielement_action(&self, _a: u32, _arg: u32) {
-            self.calls.lock().unwrap().push("uielement_action");
+            self.calls
+                .lock()
+                .unwrap()
+                .push("uielement_action".to_string());
         }
 
         // ── 以下仅为满足 trait 的必需项，本测试不关心 ──
@@ -330,7 +357,7 @@ mod tests {
         deferred.handle_input_state_report(1, true, 2, 3);
         deferred.handle_diag_snapshot(&DiagSnapshotPayload::default());
         deferred.handle_client_connected(1234);
-        deferred.handle_uielement_state(1, true);
+        deferred.handle_uielement_state(1, true, false);
         deferred.handle_uielement_action(1, 0);
         assert!(
             deferred.uielement_page().items.is_empty(),
@@ -360,10 +387,17 @@ mod tests {
             rec.got("client_connected"),
             "连接建立未转发 → 服务重启时已聚焦宿主的 per-app 规则预热整段失效"
         );
-        deferred.handle_uielement_state(7, true);
+        deferred.handle_uielement_state(7, true, true);
         deferred.handle_uielement_action(2, 0);
         deferred.note_key_source_pid(7);
         assert_eq!(deferred.uielement_page().items, vec!["x".to_string()]);
+        assert!(
+            rec.calls
+                .lock()
+                .unwrap()
+                .contains(&"uielement_state:7:true:true".to_string()),
+            "两个判据位都必须原样转发——只转 host_draws 的话，读取推断在 core 侧永远不成立"
+        );
         assert!(
             rec.got("uielement_state") && rec.got("uielement_action") && rec.got("uielement_page"),
             "UIElement 三件套未转发 → 自绘候选的游戏拿不到候选、我们的候选窗也照弹"

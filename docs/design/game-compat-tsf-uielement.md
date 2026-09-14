@@ -334,6 +334,107 @@ UTF-8 窄串的 VA。⚠️ `0x33E60` 是**文件偏移**，它落在 `.data`（
 且毫无痕迹——症状是「升级后语言栏变回清风输入法、游戏里没候选，而设置页仍显示已开启」。
 判据改为以 `HKLM\Software\<app>\Dota2CompatAlias` 为准后同一实验已通过。
 
+### 1.4 ⚠️ 传统 IMM32 宿主：多出一个候选框，还停在第一帧（2026-09-13 定案）
+
+现象（论坛 65 楼 253 帖，台服新枫之谷 `MapleStory.exe`，0.121.0 起出现）：
+游戏聊天框里**两个候选框**，上屏的字取自我们自己的那个；游戏画的那个只显示第一个码的
+候选，之后再按键也不更新。用户原话：「上個版本不會出現那個藍色候選框」。
+
+#### 证据链（用户日志 `wind_tsf.MapleStory.10508.log` + `wind_input.1.log`，五笔86）
+
+按 `T` → `Y` → `K` 一次组合：
+
+| 时刻 | 事件 | 宿主拿到的 |
+|---|---|---|
+| 23.781 | 按 `T` → `BeginUIElement ok id=0 **show=1**` | 快照 = `t` 的候选 `和 禾 長 季 麼 知 秀 行 生` |
+| 23.930 | 按 `Y` 后宿主读 `GetString(0..8)` | 和 禾 長 季 麼 知 秀 行 生 |
+| 24.783 | 按 `K` 后宿主又读 | **同上，一字未变** |
+
+同一时刻核心日志 `UpdateCandidates` 画的是 `ty` 的候选（`时 野 里 蛙 旰 昧 旱 蝻 暑`）。
+`GetUpdatedFlags` 恒回 `0x3F`（初值）也是佐证——真刷新过会算出差异位。
+
+#### 两个根因
+
+1. **快照只在 `BeginUIElement` 时取过一次。** `NotifyCandidatesVisibilityChanged` 的第三
+   分支在宿主未声明接管时只发 `UpdateUIElement`、不刷快照；而 getter 的判据是
+   `_UiElementUseSnapshot() = _uiHostDraws || 快照非空`，Begin 前的预取让快照恒非空
+   ⇒ 整个组合期间如实交付**第一帧**。
+
+2. **那个框本不该出现。** 它不是游戏自绘、也不是真 UI-less（真 UI-less 会回
+   `pbShow=FALSE`，它回的是 TRUE），而是 **CUAS 的 IMM32 桥**把我们的 TSF 候选列表桥接成
+   IMM32 候选列表后，由宿主或 `DefWindowProc` 画出的**旧版系统候选窗**。触发它的是
+   `80314c8a`（首发 v0.121.0）那条换序——「先开组合再注册元素」让桥开始发
+   `IMN_OPENCANDIDATE`。⚠ 那条换序当初是为 Dota 2 做的，而 §1.1 后来已把 Dota 2 那条路
+   **整条证伪**（身份闸门，对我们零次 `ImmGetCandidateList`）：它没救到目标宿主，却给所有
+   走 CUAS 桥的传统宿主凭空开了一个重复的框。
+
+#### 定案：读了就算它在画
+
+判据是 **`ITfCandidateListUIElement::GetString` 被调用**（真把候选文本取走），
+sticky 到本次激活结束，经 `UIELEMENT_FLAG_HOST_READS` 报给服务端。命中后：
+
+- 服务端收起我们自己的候选窗（`ui_suppressed_by_host` 判据三）——宿主画的那个贴着它
+  自己的输入框（位置由它的 `ImmSetCandidateWindow` 决定），比我们在游戏里靠 caret 猜的准；
+  这类宿主的 caret 本来就取不到（同一份日志里恒为退化矩形 `w=1 h=0`，我们的窗被摆到
+  `(-1201,250)`，另一个显示器上）。
+- 快照改为**记脏 + 懒刷**：候选变了只置 `_uiSnapshotDirty`，宿主真来读 getter 时才补拉。
+  不读的宿主一次 IPC 都不多；会读的宿主从第一次读起就拿到当前候选。
+- `BeginUIElement` 回 `pbShow=TRUE` 时也补一次 `UpdateUIElement`（规范说可不调）——
+  **为的是在首键就把会读的宿主逼出来**：实测 IMM32 桥在 Begin 之后静默 1.3s 不读，
+  第二键的 Update 一到立刻读满 9 条。不补这一下，读取闩要等到第二键才合上，而我们的
+  候选窗在首显闸门（25~600ms）里早弹出来了，用户看到的就是「先两个框、再收掉一个」。
+
+#### ⚠ 这是推断，不是事实——留了逃生口
+
+`pbShow=FALSE` 是宿主的**声明**（事实），「读了就是在画」是**推断**。读候选串的不一定
+都在画：读屏软件同样订阅 TSF UI 元素并读候选串来朗读。故两者分两位上报、分两张 pid 账，
+只有推断那条可被 compat 规则关掉：
+
+```toml
+[[apps]]
+process = "某宿主.exe"        # 或 "*" 一次关掉全局
+host_drawn_candidates = false  # 无论探测到什么都照弹我们的候选框
+```
+
+误判的表现是**两个候选框都没有**、完全不能用 ⇒ 收到这类反馈时判据先看这里。
+按 `config-design-rules` R1「可由程序判定 ⇒ 自动判定 + compat 覆盖，不加用户键」。
+
+逃生口要两层，是因为**故障半径和镊子粒度得匹配**：触发误判的若是某个常驻工具（读屏、
+辅助软件），用户面对的是「所有应用的候选框都没了」，这时不该只有逐个 exe 枚举一条路。
+通配 `"*"` 只被这一条判据的回落查表认（`HOST_DRAWN_WILDCARD`），**没有**做成
+`AppCompat::get_rule` 的通用通配——那会让一条规则把全部字段套到每个应用头上。
+
+⚠ 查覆盖时必须用**命中的那个 pid**（`current_pid_in` 回 `Option<u32>`），不能另取一次
+`active_process_name()`：后者只认 `active_compat.pid`，而游戏宿主常常没有可编辑 TSF
+上下文、`focus_gained` 一次都不来，`active_compat` 会停在**上一个进程**上（既有测试
+`key_source_pid_alone_matches_host_draws` 钉的就是这个分岔）。查错了 pid ⇒ 用户给游戏配的
+逃生口静默失效，等于把兜底也押上。回归测试
+`the_escape_hatch_works_when_only_the_key_source_pid_identifies_the_host`。
+
+#### 两条刻意留着的缺口
+
+**① `_CaretQuerySuppressed()` 不跟读取闩走**，只看宿主的声明。后果是：推断生效、core 已
+收窗时，DLL 这边仍照常向宿主探 caret——收了窗却没省掉收窗本该省掉的开销，在全屏游戏上
+与 §1.1 那条「caret 探测重试循环拖死渲染线程」同源。
+
+不改的理由有两条：把闩算进去会让「关掉了覆盖」的用户拿到一个没有坐标的候选窗，而那个
+覆盖正是误判时的唯一退路；并且同样的缺口对**判据二（D3D 独占全屏收窗）本来就存在**
+——那也是 core 侧的决定，一样传不到 DLL。正确的补法是给 core→DLL 加一条「本进程已被
+收窗」的推送，一次把两条判据都覆盖掉，属于独立的一件事。
+
+**② 合闩那一次读取的同步 IPC 发生在 msctf 的 sink 派发栈内**（`UpdateUIElement` → 宿主
+`GetString` → `_EnsureUiSnapshotFresh`），最坏按住宿主 UI 线程 `READ_TIMEOUT_MS`(1500ms)。
+**每次激活至多一次**——这一次调用必然合上闩，此后第三分支走急刷、dirty 恒为 FALSE，
+getter 再也走不到那里。⛔ 不要为此调小超时：读超时与 `_RecordFailure`/`Disconnect`/熔断
+是同一套，调小换来的是负载高时误断 IPC + 熔断 3 秒，比顿一下更糟。
+
+#### 未验证的一环（记在这里，别当成已证）
+
+**「只有真要画的宿主才会来读候选串」至今没有反证样本。** 那份日志里 7 个宿主只有
+MapleStory 读过（Excel / WebView2 / Beanfun / AweSun / DwarfAxe 全是 0 次），但另外 6 个
+当时**都没有出现过候选**，构不成负对照。要补这个对照，需要在一个普通桌面宿主里真打一次
+字、看日志有没有 `UIElement host read: GetString`。
+
 ## 2. 外部规范要点（已核对）
 
 来源：Microsoft Learn「UILess Mode Overview」、`ITfUIElementSink::BeginUIElement`、
@@ -377,7 +478,7 @@ SDL2 `SDL_windowskeyboard.c`（`UILess_GetCandidateList`）。
 
 | 命令 | 方向 | 同步 | 内容 |
 |---|---|---|---|
-| `CMD_UIELEMENT_STATE 0x0217` | DLL→核心 | 异步 | `pid u32 + flags u32`；bit0 宿主接管、bit1 UI-less 线程 |
+| `CMD_UIELEMENT_STATE 0x0217` | DLL→核心 | 异步 | `pid u32 + flags u32`；bit0 宿主接管、bit1 UI-less 线程、bit2 宿主读走了候选串（§1.4） |
 | `CMD_UIELEMENT_QUERY 0x0218` → `CMD_UIELEMENT_PAGE 0x0219` | DLL→核心 | 同步 | 候选快照：`selected/pageSize/currentPage/count + count×(len u16 + UTF-8)` |
 | `CMD_UIELEMENT_ACTION 0x021A` | DLL→核心 | 异步 | `action u32 + arg u32`：SetSelection(绝对下标) / Finalize / Abort / SetPage |
 
@@ -398,10 +499,28 @@ SDL2 `SDL_windowskeyboard.c`（`UILess_GetCandidateList`）。
 - `_uiLessThread`：`ActivateEx` 带 `TF_TMAE_UIELEMENTENABLEDONLY`。激活末尾即报 STATE，
   让候选窗**从第一个组合起**就不弹（否则要等首次 Begin 回 FALSE，先弹再收闪一帧）。
 - 报 STATE 只在 flags 变化时（`_uiElementStateSent`），激活/停用都复位成 -1 强制重报。
+- `_uiHostReadsCandidates`（§1.4）= 宿主没声明接管、却调了 `GetString` 把候选文本取走。
+  sticky 到 `Deactivate`（与 `_uiHostDraws` 一并清——pid 会复用）。
+  `_UiElementHostDraws() = _uiHostDraws || _uiHostReadsCandidates`。
+  判定点刻意选 `GetString` 而不是 `GetCount`/`GetUpdatedFlags`：后两者 msctf 自己也会问，
+  不足以说明有人要画；**取走文本**才是。占位分支（无快照时回 "…"）不打闩。
+  ⚠ 报 STATE 时 bit0 只带 `_uiHostDraws`，读取闩单独占 bit2——合并成一位，核心侧就没法
+  只关掉推断的那一半。
 - 宿主接管时的每次候选变化：`QUERY` → 快照 → 与上一份 diff 出 `TF_CLUIE_*` → `UpdateUIElement`。
-  首次（Begin 回 FALSE 之后）全位置位。
-- 宿主不接管时：getter 沿用占位数据（`GetCount=1`、"…"），**不拉快照**——保持 Chromium
-  那条调度收益且不加键路径开销。
+  首次（Begin 之后）全位置位。
+- 宿主未声明接管时：候选变化只置 `_uiSnapshotDirty` + `UpdateUIElement`，**不拉快照**；
+  宿主真来读时由 `_EnsureUiSnapshotFresh(contentRead)` 补拉一次（成功与否都清脏位——
+  失败还留着会让后续每个 getter 都重试一次同步 IPC，把宿主 UI 线程拖死）。
+  ⚠ 闩未合上时**只有 `GetString` 会触发补拉**：`GetCount` 是 msctf 自己也会问的
+  （它据此判断候选 UI「有没有意义」，Chromium 的 IME-first 调度靠这个），在那里无条件
+  补拉就等于给每个宿主的每一次按键都加一次同步 IPC——正是本次要避免的代价。
+  闩合上之后所有 getter 都补拉，保证一次读取序列内 count / pageIndex / string 同源。
+  ⛔ 别改成无条件每键拉取：那是给**每个**宿主的每一次按键都加一次宿主 UI 线程上的同步
+  IPC（读超时 1500ms），代价落在所有人身上，而真正需要它的只有会读的那一小撮。
+  无快照且宿主不接管时 getter 仍回占位（`GetCount=1`、"…"），保住 Chromium 那条调度收益。
+- `BeginUIElement` 之后**无论 `pbShow` 回什么都补一次 `UpdateUIElement`**。规范只要求回
+  FALSE 时必须调；回 TRUE 时仍调是为了在**首键**就把会读的宿主逼出来（IMM32 桥在 Begin
+  之后静默不读，要等下一次 Update 才来，见 §1.4）。不读的宿主不会因此拉快照，键路径零额外 IPC。
 - `SetSelection(n)`：发 ACTION 后立刻再拉快照并 Update——同一条管道按序处理，拉到的就是
   新高亮。`Finalize/Abort` 的结果（上屏 / 清组合）经 push 管道回来，与鼠标点选同路，
   走既有的 `NotifyCandidatesVisibilityChanged(FALSE)` → `EndUIElement`。
@@ -426,7 +545,11 @@ SDL2 `SDL_windowskeyboard.c`（`UILess_GetCandidateList`）。
 
 ### 4.4 服务端：按 pid 记账不弹窗（`handle_uielement.rs`）
 
-- `uielement_host_pids: HashSet<pid>`；`notify_ui_update` 在 `hide_candidate_window` 守卫之后
+- **两张 pid 账**：`uielement_host_pids`（宿主**声明**接管，无覆盖）与
+  `uielement_reader_pids`（宿主**读走过**候选串，可经 compat `host_drawn_candidates = false`
+  关掉，见 §1.4）。分开存是因为对它们的态度不同：一个是事实、一个是推断。
+  取 pid 的口径共用 `current_pid_in()`，免得一张改了另一张没改。
+- `notify_ui_update` 在 `hide_candidate_window` 守卫之后
   加一道 `ui_suppressed_by_host()`：命中则只发 `HideCandidates`、照常
   `reset_first_show`。**候选状态照常演进**——空格上屏、数字选词、翻页全部照旧，宿主画的
   正是这份状态。同一判据也压住**状态气泡**（`show_tip`）与**工具栏**（`notify_toolbar`）：
@@ -438,7 +561,8 @@ SDL2 `SDL_windowskeyboard.c`（`UILess_GetCandidateList`）。
 - 状态翻转立刻 `notify_ui_update`：接管报告到达时窗已弹出（首次组合的应答先于报告）要收掉；
   撤销时弹回来。
 - 清账：`handle_ime_deactivated`（token 高 32 位）与 `handle_client_connected`（新 DLL 实例会重报）。
-  pid 复用残留最多让新进程首次候选被压一帧，且会被首次 `BeginUIElement` 的重报纠正。
+  **两张账一起清**——声明账的残留会被首次 `BeginUIElement` 的重报纠正，读取账不会：
+  pid 复用后新宿主会一上来就被判成自绘，而它自己的 `GetString` 不一定会发生，没人来纠正。
 - ACTION：`SetSelection` 按绝对下标落到 `current_page/selected_index`；`SetPage` 走
   `page_next/page_prev` 原语（它们负责动态扩展与末页放宽）；`Finalize` = `mouse_select(高亮)`；
   `Abort` = `cancel_session` + 推 `ClearComposition`。

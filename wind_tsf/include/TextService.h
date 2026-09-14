@@ -455,20 +455,70 @@ private:
     };
     UiElementSnapshot _uiSnapshot;
     DWORD _uiUpdatedFlags;  // 上次 UpdateUIElement 相对前一快照的变化位（TF_CLUIE_*），GetUpdatedFlags 回答
-    BOOL  _UiElementHostDraws() const { return _uiHostDraws; }
+    // 快照相对服务端候选状态是否已过期。候选变了但宿主没声明接管时只置位、不拉取；
+    // 真有宿主来读 getter 时才补拉一次（见 _EnsureUiSnapshotFresh）。
+    // ⛔ 曾经「只 UpdateUIElement、不刷快照」：宿主被通知来读、读到的却是上一帧。
+    // 2026-09-11 新枫之谷实测——游戏画的候选盒停在**第一个码**的候选上，我们自己的窗
+    // 画的是当前码的候选，两个框内容不一致。见设计文档 §1.4。
+    BOOL  _uiSnapshotDirty;
+    // 宿主虽未声明接管（pbShow=TRUE），但确实来读过候选串。sticky：一旦读过就认定
+    // 它在画，本次激活期间不再翻回。判定点见 _NoteHostReadCandidates。
+    BOOL  _uiHostReadsCandidates;
+    // 「宿主在画候选」：声明接管（pbShow=FALSE / Show(FALSE) / UI-less 线程）**或**
+    // 实际来读过候选串。后者是推断，core 侧可经 compat 规则 host_drawn_candidates 关掉；
+    // 这里不做覆盖——DLL 只负责如实报告，压不压窗由 core 决定。
+    BOOL  _UiElementHostDraws() const { return _uiHostDraws || _uiHostReadsCandidates; }
     // 取光标坐标是否该整条短路。UI-less / 宿主接管绘制（SDL2 游戏等）时我们不弹自己的
     // 候选 / 组合窗，就**不需要**光标坐标；而向这类宿主反复发 GetTextExt（同步 edit
     // session）在 D3D 独占全屏下会把游戏渲染线程逐次拖死——Dota 2 实测：组合起后进入
     // caret 探测重试循环（OnLayoutChange burst + 50ms timer + 异步 edit session），
     // 间隔 5→187→298ms 后线程冻死。ui_less 从 ActivateEx 起已知、host_draws 从首个
     // BeginUIElement 起已知，取或覆盖首键到组合全程。
-    BOOL  _CaretQuerySuppressed() const { return _uiLessThread || _UiElementHostDraws(); }
-    // getter 答快照还是占位：有快照就答快照（Begin 之前已预取，宿主在 Begin 回调里读到的就是真数据），
-    // 没有快照且宿主不接管才答占位（Chromium 调度所需的「至少 1 条」）。
-    BOOL  _UiElementUseSnapshot() const { return _uiHostDraws || !_uiSnapshot.items.empty(); }
+    // ⚠ 只看**声明**（_uiHostDraws / _uiLessThread），不看读取闩：读取闩的结论可由 core
+    // 的 compat 规则 host_drawn_candidates 关掉，那时我们自己的候选窗照弹、就还需要坐标。
+    // 把闩算进来会让「关掉了覆盖」的用户拿到一个没有坐标、只能贴在窗口角落的候选窗——
+    // 而那个覆盖正是推断误判时的唯一退路，不能连它一起削弱。
+    //
+    // ⚠ **已知缺口（刻意留着）**：推断生效、core 已收窗时，这里仍为 FALSE，于是照常向
+    // 宿主探 caret——收了窗却没省掉收窗本该省掉的开销，在全屏游戏上与 Dota 2 那条
+    // 「caret 探测重试循环拖死渲染线程」同源。正确的判据是「core 最终有没有收窗」，
+    // 而那个答案只有 core 有；DLL 这边靠闩去猜必然在覆盖开着时猜错。
+    // 同样的缺口对判据二（D3D 独占全屏收窗）**本来就存在**——那也是 core 侧的决定，
+    // 一样传不到这里。故这不是本次引入的新一类问题，补法是给 core→DLL 加一条
+    // 「本进程已被收窗」的推送，一次把两条判据都覆盖掉。见设计文档 §1.4。
+    BOOL  _CaretQuerySuppressed() const { return _uiLessThread || _uiHostDraws; }
+    // getter 答快照还是占位。
+    //
+    // 已认定宿主在画（声明或读过）⇒ 恒答快照，与 SetSelection / Finalize / Abort 的放行
+    // 判据 `_UiElementHostDraws()` 取齐——两边不同源时会出现「GetCount 说有 1 条、
+    // GetString 给占位『…』、宿主照着选却被 SetSelection 回 E_INVALIDARG」这种自相矛盾。
+    //
+    // 尚未认定时要求快照**非空且不脏**：脏意味着候选已经变了而我们刻意没去拉
+    // （见 _EnsureUiSnapshotFresh 的成本论证），这时答旧快照就是在交付上一帧。
+    // ⛔ 曾经漏掉 `!_uiSnapshotDirty` 这一半：合闩那一次读取序列里 GetCount 答**上一键**的
+    // 条数、GetString 答**本键**的内容（它自己会先补拉），宿主拿到「旧条数 + 新内容」——
+    // 条数相等时看不出来（实测 t→ty 都是 9 条），末页或候选变少时就会多画空位、
+    // 或尾部若干次 GetString 撞上 E_INVALIDARG。答占位（count=1）虽然保守，但自洽，
+    // 且下一键即恢复。
+    BOOL  _UiElementUseSnapshot() const
+    {
+        if (_UiElementHostDraws()) return TRUE;
+        return !_uiSnapshot.items.empty() && !_uiSnapshotDirty;
+    }
     void  _ReportUiElementState();        // flags 变化时发 CMD_UIELEMENT_STATE
     BOOL  _RefreshUiElementSnapshot();    // 同步拉取快照并计算 _uiUpdatedFlags；失败清空快照
     void  _UpdateUiElementForHost();      // 宿主接管时：拉快照 + UpdateUIElement
+    // getter 入口的补拉：快照过期就现拉一次。
+    //
+    // `contentRead` = 本次调用是不是在**取候选内容本身**（只有 GetString 传 TRUE）。
+    // ⚠ 这个参数不是洁癖：`GetCount` 是 **msctf 自己**也会问的（它据此判断候选 UI
+    // 「有没有意义」，Chromium 的 IME-first 调度就靠这个），无条件在那里补拉等于给
+    // 每个宿主的每一次按键都加一次宿主 UI 线程上的同步 IPC——正是本次要避免的代价。
+    // 故：闩未合上时只有 GetString 会触发补拉（它同时就是判定点，一调即合闩），
+    // 闩合上之后所有 getter 都补拉，保持一次读取序列内各答案同源。
+    void  _EnsureUiSnapshotFresh(BOOL contentRead = FALSE);
+    // 宿主读了候选串 → 置 sticky 闩并立刻报服务端（它据此收掉我们自己的候选窗）。
+    void  _NoteHostReadCandidates();
     void  _SendUiElementAction(uint32_t action, uint32_t arg);
     ITfSourceSingle* _pSourceSingle;  // 缓存的 ITfSourceSingle 引用（Function Provider 注册用）
     BOOL  _funcProviderRegistered;    // 是否已通过 AdviseSingleSink 注册

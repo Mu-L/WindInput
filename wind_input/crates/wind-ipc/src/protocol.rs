@@ -144,6 +144,17 @@ pub const UIELEMENT_FLAG_HOST_DRAWS: u32 = 0x0001;
 /// 可以直接省掉——故服务端把它当作与 bit0 同义，**从激活起**就不弹窗，省掉首次组合
 /// 时「先弹再收」的一帧闪烁。
 pub const UIELEMENT_FLAG_UI_LESS_THREAD: u32 = 0x0002;
+/// [`UiElementStatePayload::flags`] bit2：宿主**没有**声明接管（`pbShow=TRUE`），却实际
+/// 调了 `ITfCandidateListUIElement::GetString` 把候选串取走。
+///
+/// 已知的读取者是 CUAS 的 IMM32 桥——传统宿主经 `ImmGetCandidateList` 取候选，由宿主
+/// 或 `DefWindowProc` 画出旧版候选窗。2026-09-11 新枫之谷实测：屏幕上两个候选框，游戏
+/// 画的那个还停在第一个码的候选上。
+///
+/// ⚠ 与 bit0 **分开报**：bit0 是宿主的声明（事实），本位是「读了就是在画」的推断。
+/// 推断可能误伤（读屏软件也订阅 UI 元素并读候选串），故 core 侧对本位单独记账、
+/// 可经 compat 规则 `host_drawn_candidates = false` 逐宿主关掉。合并成一位就关不掉了。
+pub const UIELEMENT_FLAG_HOST_READS: u32 = 0x0004;
 
 /// [`UiElementActionPayload::action`]：把高亮移到**页内**下标 `arg`（`SetSelection`；
 /// 快照只带当页，宿主眼里的下标就是页内下标）。
@@ -839,9 +850,14 @@ impl UiElementStatePayload {
         })
     }
 
-    /// 宿主是否接管候选绘制（两位任一置位即视为接管，见各位注释）。
+    /// 宿主是否**声明**接管候选绘制（两位任一置位即视为接管，见各位注释）。
     pub fn host_draws(&self) -> bool {
         self.flags & (UIELEMENT_FLAG_HOST_DRAWS | UIELEMENT_FLAG_UI_LESS_THREAD) != 0
+    }
+
+    /// 宿主是否实际读走了候选串（推断它在自绘，见 [`UIELEMENT_FLAG_HOST_READS`]）。
+    pub fn host_reads(&self) -> bool {
+        self.flags & UIELEMENT_FLAG_HOST_READS != 0
     }
 }
 

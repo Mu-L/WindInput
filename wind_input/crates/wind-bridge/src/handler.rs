@@ -478,9 +478,12 @@ pub trait MessageHandler: Send + Sync {
 
     // ── TSF UI-less（宿主自绘候选）三件套，见 wind-ipc `CMD_UIELEMENT_*` 注释 ──
 
-    /// DLL 报告某进程的 UIElement 状态：`host_draws` = 宿主接管候选绘制（含 UI-less 线程）。
+    /// DLL 报告某进程的 UIElement 状态。两个判据分开传，因为消费端对它们的态度不同：
+    /// - `host_draws`：宿主**声明**接管候选绘制（`pbShow=FALSE` / UI-less 线程）——事实，无覆盖；
+    /// - `host_reads`：宿主没声明却把候选串读走了——推断，可经 compat `host_drawn_candidates` 关掉。
+    ///
     /// 消费方按 pid 记账，该进程聚焦期间不弹自己的候选窗。默认空实现。
-    fn handle_uielement_state(&self, _pid: u32, _host_draws: bool) {}
+    fn handle_uielement_state(&self, _pid: u32, _host_draws: bool, _host_reads: bool) {}
 
     /// 每个按键事件的**发送进程** pid（管道对端）。按键是「谁在输入」的最强证据：
     /// 游戏这类宿主常常没有可编辑 TSF 上下文，`focus_gained` 一次都不会来，光靠焦点事件
