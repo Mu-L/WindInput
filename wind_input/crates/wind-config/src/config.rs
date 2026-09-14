@@ -3477,11 +3477,24 @@ pub struct TempEnglishConfig {
     /// （只覆盖用户按了 Shift 的那几位，词库自带的大写一律保留）。
     #[serde(default = "default_true")]
     pub case_follow_input: bool,
+    /// 临英选词上屏后自动补一个空格。
+    ///
+    /// 与 `schema.english.commit_space` 是**两个作用域各一份**，不是两个真相源 ——
+    /// 同 [`Self::raw_candidate`] 那一对的理由：用户对「长时打英文」与「中文里插一个
+    /// 英文词」的需求本就可能相反。前者连着打词、补空格顺手；后者插完往往接中文或标点，
+    /// 补上的空格还得退格删掉。
+    ///
+    /// ⚠️ **行为变更**（此前两者共用 `schema.english.commit_space`）：升级前开着英文方案
+    /// 那个开关的用户，临英会从「补」变成「不补」，需要另外打开本项。出厂两者皆关，
+    /// 故只影响主动开启过的用户。
+    #[serde(default)]
+    pub commit_space: bool,
 }
 
 impl Default for TempEnglishConfig {
     fn default() -> Self {
         Self {
+            commit_space: false,
             enabled: true,
             show_candidates: true,
             shift_behavior: "temp_english".to_string(),

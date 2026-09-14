@@ -1225,13 +1225,14 @@ impl MessageHandler for Coordinator {
                     let mut text = self.maybe_convert(&state, &format!("{}{}", prefix, raw_code));
                     // 英文补空格（`schema.english.commit_space`）：本分支上屏的是**输入缓冲
                     // 原码**（词库里没有的自造词），无候选可依，故用方案口径
-                    // `english_space_enabled` 而非候选口径。与选中候选补空格一致——两者都是
+                    // `english_space_enabled_in`（语境口径）而非候选口径。与选中候选补空格一致——两者都是
                     // 「一个英文词打完了」，行为分叉才是意外。
                     //
                     // ⚠️ 下方 VK_RETURN 分支代码与本块**逐行同形**，但**刻意不补**：回车是
                     // 终结性动作（多伴随换行/提交意图），语义与「接着打下一个词」相反。改这里
                     // 时别顺手把那边也改了。
-                    if self.english_space_enabled() {
+                    // 手上有 `state` ⇒ 用带语境的那个：临英与英文方案现在是两份开关。
+                    if self.english_space_enabled_in(&state) {
                         text.push(' ');
                     }
                     state.input_buffer.clear();
@@ -3483,6 +3484,7 @@ impl MessageHandler for Coordinator {
                     let (t, s, f) = cand_meta(c);
                     // 与按键路径同口径：头部候选（输入原文）不带 source，只认 source 会漏补。
                     let ap = self.english_appends_space(
+                        &state,
                         s,
                         &t,
                         crate::preedit_cursor::cased_or_buffer(
@@ -3501,7 +3503,8 @@ impl MessageHandler for Coordinator {
                 // （`enter_behavior`）都得补判据，否则表现为「开关只在部分宿主/部分时机生效」。
                 None => {
                     let (t, s, f) = raw();
-                    (t, s, f, self.english_space_enabled())
+                    // 手上有 `state`（本函数开头就取了锁），故按语境取两份开关中的一份。
+                    (t, s, f, self.english_space_enabled_in(&state))
                 }
             }
         } else if tk == keymap::VK_RETURN {
@@ -3515,6 +3518,7 @@ impl MessageHandler for Coordinator {
                     let (t, s, f) = cand_meta(c);
                     // 与按键路径同口径：头部候选（输入原文）不带 source，只认 source 会漏补。
                     let ap = self.english_appends_space(
+                        &state,
                         s,
                         &t,
                         crate::preedit_cursor::cased_or_buffer(

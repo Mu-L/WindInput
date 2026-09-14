@@ -230,7 +230,7 @@ fn raw_code_space_commit_appends_space() {
 /// 首字母大写时，「空格上屏原码」的**空码兜底分支**照样补空格。
 ///
 /// ⚠️ **这条不是 t122 的复现**（复现见 `space_select_appends_space_when_capitalized`）。
-/// 它走的是 `message_handler` 里那条无候选兜底路径，判据只有一句 `english_space_enabled()`
+/// 它走的是 `message_handler` 里那条无候选兜底路径，判据只有一句 `english_space_enabled_in`
 /// ——不过候选级判据，所以缺陷期它就是绿的。留着是为了钉住「这条通路对大小写不敏感」，
 /// 免得日后有人把候选级判据一并塞进这里。
 ///

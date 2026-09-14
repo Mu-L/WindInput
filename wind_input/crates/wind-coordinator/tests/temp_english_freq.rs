@@ -421,14 +421,18 @@ fn temp_english_freq_carries_over_to_english_schema() {
 
 // ───────────────────────── 补空格 ─────────────────────────
 
-/// 临英选词上屏同样补空格（`schema.english.commit_space`）——与英文方案同一个开关。
+/// 临英选词上屏补空格，开关是 **`input.temp_english.commit_space`**（临英自己那一份）。
+///
+/// 此前临英与英文方案共用 `schema.english.commit_space`，2026-09-14 拆成两份：
+/// 用户对「长时打英文」与「中文里插一个英文词」的取舍本就可能相反 ——
+/// 前者连着打词、补空格顺手；后者插完往往接中文或标点，补上的还得退格删掉。
 #[test]
 fn temp_english_select_appends_space() {
     if !has_english_schema() {
         return;
     }
     let mut cfg = temp_english_config(false, "position");
-    cfg.schema.english.commit_space = true;
+    cfg.input.temp_english.commit_space = true;
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
 
     enter_temp_english(&coord, "hel");
@@ -444,13 +448,36 @@ fn temp_english_no_space_when_disabled() {
         return;
     }
     let mut cfg = temp_english_config(false, "position");
-    cfg.schema.english.commit_space = false;
+    cfg.input.temp_english.commit_space = false;
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
 
     enter_temp_english(&coord, "hel");
     let picked = dict_texts(&coord).first().cloned().expect("应有词库候选");
     let text = commit_text(&coord.handle_key_event(&key(VK_2, 0)));
     assert_eq!(text, picked, "开关关闭时不得补空格");
+}
+
+/// ★ **两份开关互不越界**：开英文方案那份，临英**不得**跟着补。
+///
+/// 这一条是拆分的验收标准。没有它，「两个字段、内部仍读同一个」的实现照样能让上面两条通过
+/// —— 那正是拆分前的状态。
+#[test]
+fn english_schema_switch_does_not_leak_into_temp_english() {
+    if !has_english_schema() {
+        return;
+    }
+    let mut cfg = temp_english_config(false, "position");
+    cfg.schema.english.commit_space = true; // 英文方案：开
+    cfg.input.temp_english.commit_space = false; // 临英：关
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    enter_temp_english(&coord, "hel");
+    let picked = dict_texts(&coord).first().cloned().expect("应有词库候选");
+    let text = commit_text(&coord.handle_key_event(&key(VK_2, 0)));
+    assert_eq!(
+        text, picked,
+        "临英该看自己那份开关：英文方案开着不代表临英也补空格"
+    );
 }
 
 /// 回车上屏原文**不补空格**——终结性动作，与英文方案 `VK_RETURN` 空码分支同口径。
@@ -463,7 +490,7 @@ fn temp_english_enter_never_appends_space() {
         return;
     }
     let mut cfg = temp_english_config(false, "position");
-    cfg.schema.english.commit_space = true;
+    cfg.input.temp_english.commit_space = true;
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
 
     enter_temp_english(&coord, "hel");

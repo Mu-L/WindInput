@@ -374,6 +374,7 @@ static REGISTRY: &[ConfigField] = &[
     f("input.temp_english.symbol_chars", Str),
     f("input.temp_english.space_as_input", Bool),
     f("input.temp_english.raw_candidate", Bool),
+    f("input.temp_english.commit_space", Bool),
     f("input.temp_english.case_variants", Bool),
     f("input.temp_english.case_follow_input", Bool),
     f(

@@ -2636,7 +2636,7 @@ impl Coordinator {
             Some(t) => t.to_string(),
             None => self.maybe_convert(state, text),
         };
-        if self.english_appends_space(source, text, crate::preedit_cursor::cased_or_buffer(
+        if self.english_appends_space(state, source, text, crate::preedit_cursor::cased_or_buffer(
                 &state.input_buffer,
                 &state.input_buffer_cased,
             )) {
@@ -2794,31 +2794,21 @@ impl Coordinator {
         })
     }
 
-    /// 英文上屏后补空格的**方案口径**（`schema.english.commit_space` + 当前是英文方案）。
+    /// 补空格的**唯一对外入口**：按语境分流到两份开关中的一份。
     ///
-    /// 供**无候选可依**的出口使用——「空格上屏原码」上屏的是输入缓冲本身
-    /// （`CandidateSource::None`），拿不到来源，只能按方案判定。
+    /// 英文方案与临英自 2026-09-14 起各有一份 `commit_space`，而只有 `state` 能区分这两种
+    /// 语境，故所有出口都得走这里。
     ///
-    /// 判「用户此刻正在打英文」这一条不可省：`CandidateSource::English` 在混输、快捷输入里
-    /// 同样出现，而那些场景用户正在写中文句子，插个英文词后面平白多个空格是错的。
-    ///
-    /// **临时英文算在内**：它与英文方案打的是同一份词库，用户意图同样是「连着打英文词」，
-    /// 差别只在进入方式。混输/快捷里的英文候选则不算——判据问的是**当前整个输入语境**是不是
-    /// 英文，不是这一条候选来自哪里。
-    ///
-    /// ⚠️ 注意本项与同段的 `frequency.code_scope` **判据相反**：那个按**候选来源**生效
-    /// （英文候选走到哪都该按同一口径记账），这个按**输入语境**。改动其一时别照着另一个抄。
-    pub(crate) fn english_space_enabled(&self) -> bool {
-        self.english_space_for(false)
-    }
-
-    /// 同 [`Self::english_space_enabled`]，但把 overlay 语境一并算进去。
-    ///
-    /// 有 `state` 的出口一律用这个；`english_space_enabled` 留给 DLL 侧 IPC 排水那条
-    /// **拿不到模式上下文**的路径。两者共用下面的单一真相源，免得日后漂移成
-    /// 「键盘上屏补了、排水路径没补」。
+    /// 曾另有一个不带 state 的 `english_space_enabled()`，理由是「留给拿不到模式上下文的
+    /// 路径」。拆分后复查发现那个理由**不成立** —— 它最后的调用者在 `handle_commit_request`
+    /// 里，而该函数第二行就取了 state。已删除：零调用点的入口留着只会被误用，
+    /// 而误用的形态就是「临英下读了英文方案那份开关」，本次已因此修过一个鼠标点选的缺陷。
     pub(crate) fn english_space_enabled_in(&self, state: &State) -> bool {
-        self.english_space_for(self.in_english_input_context(state))
+        // ⚠️ 传的必须是「**是不是临英**」，不能图省事传 `in_english_input_context`
+        // （那是「英文方案 **或** 临英」）。分开开关之前两者指向同一个开关、混用无害；
+        // 分开之后混用会让**英文方案**也去取临英那份开关 —— 实测表现为英文方案下
+        // 「空格上屏原码」不补空格（`raw_code_space_commit_appends_space` 变红）。
+        self.english_space_for(state.active == Some(ModeKind::TempEnglish))
     }
 
     /// 「用户此刻正在打英文」——英文方案常驻，或临英 overlay。**单一真相源**。
@@ -2833,10 +2823,30 @@ impl Coordinator {
         self.engine_mgr.active_is_english() || state.active == Some(ModeKind::TempEnglish)
     }
 
-    /// 补空格判据的单一真相源：开关 + 「英文语境」（英文方案常驻 或 临英 overlay）。
+    /// 补空格判据的单一真相源。**两个作用域各一份开关**，按语境取用：
+    ///
+    /// | 语境 | 开关 |
+    /// |---|---|
+    /// | 英文方案常驻 | `schema.english.commit_space` |
+    /// | 临英 overlay | `input.temp_english.commit_space` |
+    ///
+    /// 分开的理由与 `raw_candidate` 那一对相同（见 `TempEnglishConfig::commit_space`）：
+    /// 用户对「长时打英文」与「中文里插一个英文词」的需求本就可能相反 —— 前者连着打词、
+    /// 补空格顺手；后者插完往往接中文或标点，补上的空格还得退格删掉。
+    ///
+    /// **先判临英**：临英 overlay 期间一律以临英那份为准。
+    ///
+    /// ⚠️ 不要写成「两者互斥」—— `handle_lifecycle` 那道「★ 英文方案下不进临英」的门禁
+    /// **只管 Shift+字母一条路**。另外三条进临英的路都没有它，只判 `temp_english.enabled`：
+    /// `BoundAction::TempEnglish`（`trigger_keys` / `key_actions` 绑的符号键）、
+    /// 顶字进入（`handle_mode`）、z 键夺取回退（`handle_temp`）。用户在英文方案下给
+    /// `` ` `` 绑 `temp_english` 再按它，`state.active == TempEnglish` 与
+    /// `active_is_english()` 就同时为真 —— 那时读临英这一份仍是对的（用户确实在 overlay 里）。
     fn english_space_for(&self, in_temp_english: bool) -> bool {
-        self.rt().config.schema.english.commit_space
-            && (self.engine_mgr.active_is_english() || in_temp_english)
+        if in_temp_english {
+            return self.rt().config.input.temp_english.commit_space;
+        }
+        self.engine_mgr.active_is_english() && self.rt().config.schema.english.commit_space
     }
 
     /// 英文**候选**上屏后是否补一个空格：方案口径之上，再要求「这条候选算英文内容」。
@@ -2871,15 +2881,38 @@ impl Coordinator {
     /// （打 `usa` 选中 `USA`，`source == Phrase`）一并补上空格 —— 最后一条正好违反上面
     /// 第一条理由里写的「短语等其它来源不该补空格」。
     ///
-    /// ⚠️ 非英文方案不会误中：`english_space_enabled` 已经要求 `active_is_english()`。
+    /// ⚠️ 非英文**语境**不会误中：`english_space_enabled_in` 要么要求 `active_is_english()`
+    /// （英文方案），要么要求 `state.active == TempEnglish`（临英 overlay），中文语境下两条
+    /// 都不成立。（原文写「`english_space_enabled` 已经要求 `active_is_english()`」——
+    /// 那个函数已删，且临英分支本就不经过 `active_is_english()`，照着推会得出
+    /// 「临英下这里恒 false」的相反结论，正是本次修掉的那个坑。）
     pub(crate) fn english_appends_space(
         &self,
+        state: &State,
         source: CandidateSource,
         text: &str,
         input: &str,
     ) -> bool {
+        // ⚠️ 必须是 `_in`（按语境取两份开关中的一份），不能用不带 state 的
+        // `english_space_enabled()`。后者恒等于「英文方案那一份 + `active_is_english()`」，
+        // 而临英是**中文方案之上的 overlay**（active schema 仍是码表/拼音）⇒ 那个判据恒 false
+        // ⇒ 走到这条路的临英上屏（鼠标点选、移动端候选栏）永远不补空格，哪怕用户把
+        // `input.temp_english.commit_space` 打开了。2026-09-14 审查发现，已改。
+        //
+        // ⚠️ **全角态下本路径补的是半角空格**，与键盘出口不一致：键盘经
+        // `commit_temp_english_text` 会按 `state.full_width` 转全角（U+3000），而这条
+        // overlay 路径整条都不接 `to_full_width` —— 正文本身也一样（既有缺口，非本次引入）。
+        // 本次往这条路上新加了一个空格字符，等于把那个差异扩大了一格，记在此处。
+        //
+        // ⚠️ **覆盖边界**：临英经本函数的两条入口（`select_candidate_at` 的 overlay 分支
+        // → 鼠标点选、`candidate_pull` → 移动端候选栏）**没有端到端测试**。它们的上屏不经
+        // KeyAction 返回值，而是 `push_server.push_commit_to_active` 投递；`PushServer` 没有
+        // 公开的客户端注册接口（注册在 pipe 监听里），集成测试无从观测那条通道。
+        // 现由键盘路径的 `temp_english_select_appends_space` 间接保障 —— 两条路自本次起
+        // **共用同一个判据**（就是下面这个表达式）。若日后有人把这两条路的判据拆开写，
+        // 这层间接保障立刻失效，届时必须补真测试。
         (source == CandidateSource::English || (!input.is_empty() && text == input))
-            && self.english_space_enabled()
+            && self.english_space_enabled_in(state)
     }
 
     /// 词频记账用的码——**码表与拼音/英文口径不同**，这是两类方案的语义差异。
@@ -3117,7 +3150,7 @@ impl Coordinator {
             //
             // 补在 s2t 之后：空格不参与简繁转换，且提前补会让 STPhrases 的词级最长匹配断在
             // 空格上。
-            if self.english_appends_space(cand.source, &cand.text, crate::preedit_cursor::cased_or_buffer(
+            if self.english_appends_space(state, cand.source, &cand.text, crate::preedit_cursor::cased_or_buffer(
                 &state.input_buffer,
                 &state.input_buffer_cased,
             )) {
