@@ -2,8 +2,8 @@
 
 #include "Globals.h"
 #include <ctffunc.h> // ITfIntegratableCandidateListUIElement（Dota 2 等自绘候选宿主的必需接口）
-#include "UiElementPolicy.h" // 候选 UI 元素的纯判据（可单测，见 tests/uielement_policy_test.cpp）
 #include "BinaryProtocol.h" // HostWindowKind / HOST_WINDOW_KIND_COUNT for the host window array
+#include "UiElementPolicy.h" // 候选 UI 元素的纯判据（可单测，见 tests/uielement_policy_test.cpp）
 // AsyncCaretResult / CaretProbeKind 按值出现在 OnAsyncCaretRectReady 签名里，需要完整定义。
 // 反向不成立（CaretEditSession.h 只前置声明 CTextService），故无循环包含。
 #include "CaretEditSession.h"
@@ -525,10 +525,16 @@ private:
     // 「有没有意义」，Chromium 的 IME-first 调度就靠这个），无条件在那里补拉等于给
     // 每个宿主的每一次按键都加一次宿主 UI 线程上的同步 IPC——正是本次要避免的代价。
     //
-    // ⚠️ **取元信息的 5 个 getter 里那句补拉当前不可达**（`ShouldRefreshOnGet` 在
-    // contentRead=FALSE 时恒回 FALSE）：脏位只在「未认定在画」那一支被置起，而读取闩
-    // 只在 `GetString` 里合上、合闩之前必先补拉并清脏 ⇒ 「脏 + 闩已合」进不来。
-    // 留着是防御性的，真值表单测 `TestUnreachableCells` 把这条不变量钉住了。
+    // ⚠️ **取元信息的 5 个 getter 里那句补拉当前不可达**：脏位只在「未认定在画」那一支
+    // 被置起，而读取闩只在 `GetString` 里合上、合闩之前必先补拉并清脏 ⇒「脏 + 闩已合」
+    // 进不来，于是 `ShouldRefreshOnGet(dirty, FALSE, readCandidates)` 取不到为真的那一格。
+    // （它本身**不是**「contentRead=FALSE 时恒回 FALSE」——那样写就与
+    //  uielement_policy_test.cpp 里的断言直接打架了；不可达来自调用方的不变量，不是
+    //  这个函数的性质。）
+    // 留着是防御性的。看守在 `_EnsureUiSnapshotFresh` 入口：每次调 `InvariantBroken`，
+    // 破了记 WARN 进环形缓冲——⛔ 别改回「用一个 constexpr 常量 + 单测断言它为假」，
+    // 那是拿字面量自证其说、与本文件毫无耦合（2026-09-14 三轮审查实测：真把不变量破掉，
+    // 整个测试套一条都不会红）。
     // ⛔ 别把它写成「闩合上之后所有 getter 都补拉、保证一次读取序列内同源」——
     // 同源实际来自第三分支的急刷，而**恰恰在合闩那一次读取序列里不成立**
     // （`GetCount` 那一帧答占位 count=1，见设计文档 §1.4）。

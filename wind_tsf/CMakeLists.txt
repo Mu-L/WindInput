@@ -122,8 +122,8 @@ target_sources(${TSF_TARGET_NAME} PRIVATE ${CMAKE_BINARY_DIR}/${TSF_TARGET_NAME}
 
 # ── 单元测试（默认 OFF，不影响 DLL 构建）───────────────────────────────────
 #
-# 目前有 SkipKeyTable 与 InstallerGuard。本目录绝大多数代码与 TSF/COM 纠缠、测不动；
-# 这两个是被刻意剥出来的纯逻辑（不含任何 Win32 头，时钟与进程存活由调用方传入），
+# 目前有 SkipKeyTable、InstallerGuard 与 UiElementPolicy。本目录绝大多数代码与 TSF/COM 纠缠、测不动；
+# 这三个是被刻意剥出来的纯逻辑（不含任何 Win32 头，时钟与进程存活由调用方传入），
 # 所以能测。PairEngine、ClassifyInputKey 这类纯判据日后可照同一条路补进来。
 #
 # ⚠️ 覆盖边界：这里测的只是「判据」，不是「取数」。以 InstallerGuard 为例，

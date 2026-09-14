@@ -18,9 +18,15 @@ namespace uielement
 /// 「宿主在画候选」——声明接管**或**实际读走过候选串。
 ///
 /// 两个入参语气不同，合并只发生在这一个函数里：`declared` 是宿主自己说的
-/// （`BeginUIElement` 回 `pbShow=FALSE` / `Show(FALSE)` / UI-less 线程），是事实；
+/// （`BeginUIElement` 回 `pbShow=FALSE` / `Show(FALSE)`），是事实；
 /// `readCandidates` 是「它把候选文本取走了」的推断。上报给服务端时**必须分两位**，
 /// 因为推断那一半可被 compat 规则 `host_drawn_candidates` 关掉。
+/// ⚠ `declared` **刻意不含 `_uiLessThread`**（调用方只传 `_uiHostDraws`）：UI-less 线程的
+/// `BeginUIElement` 按规范必回 `pbShow=FALSE`，`_uiHostDraws` 随即置真，这里无须再并一次；
+/// 并进来反而会在「UI-less 线程的 Begin 意外回了 TRUE」时改变行为。
+/// 同一份代码里还有两处口径**更宽**，勿混用：
+///   - `CTextService::_CaretQuerySuppressed()` = `_uiLessThread || _uiHostDraws`；
+///   - 服务端 `UiElementStatePayload::host_draws()` = `HOST_DRAWS | UI_LESS_THREAD`。
 constexpr bool HostDraws(bool declared, bool readCandidates)
 {
     return declared || readCandidates;
@@ -63,20 +69,21 @@ constexpr bool ShouldRefreshEagerly(bool declared, bool readCandidates)
     return HostDraws(declared, readCandidates);
 }
 
-/// 脏位是否**可能**与「已认定在画」同时成立。
+/// 「脏位 ∧ 已认定在画」这个组合是否出现了——出现即**调用方的不变量被破坏**。
 ///
-/// 恒 false，而且这是一条**由调用方维持的不变量**，不是这里推出来的结论：脏位只在
-/// [`ShouldRefreshEagerly`] 回 false 那一支被置起（见 `NotifyCandidatesVisibilityChanged`
-/// 第三分支），而读取闩只在 `GetString` 里合上、合闩之前必先经 [`ShouldRefreshOnGet`]
-/// 补拉并清脏。
+/// 不变量本身不在这里，在调用方：脏位只在 [`ShouldRefreshEagerly`] 回 false 那一支被
+/// 置起（`NotifyCandidatesVisibilityChanged` 第三分支），而读取闩只在 `GetString` 里合上、
+/// 合闩之前必先经 [`ShouldRefreshOnGet`] 补拉并清脏。于是这个组合进不来，取元信息那 5 个
+/// getter 里的补拉是**防御性死代码**。
 ///
-/// 写成一个函数是为了让真值表单测**机械地**把它钉住：一旦有人在别处置脏、或让闩在
-/// 别的路径上合，`ShouldRefreshOnGet(dirty=true, contentRead=false, …)` 那几个
-/// 当前不可达的格子就会变成可达，届时 5 个取元信息的 getter 里那句补拉会从
-/// 「防御性死代码」变回活代码——那正是它留在那里的理由。
-constexpr bool DirtyCanCoexistWithHostDraws()
+/// ⛔ 别写成 `constexpr bool DirtyCanCoexistWithHostDraws() { return false; }` 再拿单测
+/// 断言它为假——那是拿一个字面量自证其说，与 `TextService.cpp` 没有任何耦合：真在急刷
+/// 那支加一句 `_uiSnapshotDirty = TRUE` 把不变量破掉，整个测试套一条都不会红
+/// （2026-09-14 三轮审查实测）。看守必须落在**会被执行到的那条路**上，所以做成一个
+/// 谓词，由 `_EnsureUiSnapshotFresh` 在运行时调用、破了就记 WARN 进环形缓冲。
+constexpr bool InvariantBroken(bool dirty, bool declared, bool readCandidates)
 {
-    return false;
+    return dirty && HostDraws(declared, readCandidates);
 }
 
 } // namespace uielement

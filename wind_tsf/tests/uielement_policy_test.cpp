@@ -38,9 +38,12 @@ const char* g_case = "";
         }                                                                                \
     } while (0)
 
-#define CASE(name)          \
-    g_case = name;          \
-    std::printf("  %s\n", name)
+#define CASE(name)                 \
+    do                             \
+    {                              \
+        g_case = name;             \
+        std::printf("  %s\n", name); \
+    } while (0)
 
 // 四个布尔输入的全枚举，省得手抄 16 行还抄漏。
 template <typename F>
@@ -124,25 +127,18 @@ void TestEagerRefresh()
     });
 }
 
-void TestUnreachableCells()
+void TestInvariantPredicate()
 {
-    CASE("★ 不变量：脏位与「已认定在画」不共存 ⇒ 上面那两格当前不可达");
-    // 调用方维持的不变量（见 UiElementPolicy.h 的 DirtyCanCoexistWithHostDraws 说明）：
-    // 脏位只在 ShouldRefreshEagerly 回 false 那一支被置起，而读取闩只在 GetString 里
-    // 合上、合闩之前必先经 ShouldRefreshOnGet(contentRead=true) 补拉并清脏。
-    CHECK(!DirtyCanCoexistWithHostDraws());
-
-    // 于是「脏 + 闩已合」这个组合当前进不来，`ShouldRefreshOnGet(true, false, true)`
-    // 那一格（以及 5 个取元信息 getter 里那句补拉）是**防御性死代码**。
-    //
-    // ⛔ 这不是「可以删掉」的意思：留着是为了万一有人在别处置脏、或让闩在别的路径上
-    // 合，行为仍然正确。本用例存在的价值是——那天真到来时，把这里的
-    // DirtyCanCoexistWithHostDraws 改成 true 就会红，逼人回来重新称量，而不是让一句
-    // 「所有 getter 都补拉」的注释继续骗人。
-    if (DirtyCanCoexistWithHostDraws())
-    {
-        CHECK(ShouldRefreshOnGet(/*dirty=*/true, /*contentRead=*/false, /*readCands=*/true));
-    }
+    CASE("InvariantBroken：只在「脏 ∧ 已认定在画」时为真");
+    // ⚠️ 这条测的是**谓词本身**，不是「不变量成立」——那是 TextService.cpp 的性质，
+    // 这里够不着。真正的看守在 _EnsureUiSnapshotFresh 里：它每次都调这个谓词，破了记
+    // WARN 进环形缓冲。本用例保证那个看守的判据不会被改歪（比如写反、或漏掉读取闩）。
+    CHECK(!InvariantBroken(/*dirty=*/false, /*declared=*/false, /*readCands=*/false));
+    CHECK(!InvariantBroken(/*dirty=*/false, /*declared=*/true, /*readCands=*/true));
+    CHECK(!InvariantBroken(/*dirty=*/true, /*declared=*/false, /*readCands=*/false)); // 正常态
+    CHECK(InvariantBroken(/*dirty=*/true, /*declared=*/true, /*readCands=*/false));
+    CHECK(InvariantBroken(/*dirty=*/true, /*declared=*/false, /*readCands=*/true));
+    CHECK(InvariantBroken(/*dirty=*/true, /*declared=*/true, /*readCands=*/true));
 }
 
 } // namespace
@@ -154,7 +150,7 @@ int main()
     TestUseSnapshot();
     TestRefreshCost();
     TestEagerRefresh();
-    TestUnreachableCells();
+    TestInvariantPredicate();
 
     if (g_failures == 0)
     {

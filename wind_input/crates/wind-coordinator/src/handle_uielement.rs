@@ -623,10 +623,30 @@ mod tests {
                 ..Default::default()
             },
         );
+        // 前置对照：唯一的断言是 `None`（三条判据全不命中），而「读取账根本没命中」
+        // 也会得到 None ⇒ 不先钉住这一条，将来 set_uielement_host_reads 静默失效时
+        // 本用例会继续绿。
+        assert!(c.uielement_host_reads(), "前置：读取账必须真的命中");
         assert_eq!(
             c.ui_suppressed_by_host(),
             None,
             "两个 pid 都命中时应取 focus_pid（按键来源）去查覆盖"
+        );
+
+        // 反向对照：把逃生口改挂到 active_compat.pid 那个名字上就**不该**生效——
+        // 一正一反锁死方向，只有「查名用的是 focus_pid」能同时满足两条。
+        compat_rule(
+            &c,
+            wind_config::app_compat::AppCompatRule {
+                process: "explorer.exe".into(),
+                host_drawn_candidates: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            c.ui_suppressed_by_host(),
+            Some("uielement_host_reads"),
+            "逃生口挂在 active_compat.pid 的名字上不该生效"
         );
     }
 

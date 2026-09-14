@@ -2509,6 +2509,17 @@ void CTextService::_EnsureUiSnapshotFresh(BOOL contentRead)
     // IPCClient.h 的 IPCConfig 注释——「超时过短会把偶发慢误判为服务挂死而断连」），
     // 调小换来的是负载高时误断 IPC + 熔断 3 秒，比顿一下更糟。上面那条「失败时每键一次」
     // 恰恰是**不该调小**的又一条理由：熔断才是这条路的正确闸门。
+    // 不变量看守：脏位与「已认定在画」不该共存（见 UiElementPolicy.h 的 InvariantBroken）。
+    // 破了不是崩溃级问题——下面照常补拉，结果仍然正确——但它说明有人在别处置了脏，
+    // 取元信息那 5 个 getter 里的补拉会从死代码变回活代码，那些路径此前从未被执行过。
+    // 记 WARN 而非 DEBUG：WARN 恒进环形缓冲，用户不开文件日志也能用 Ctrl+Shift+F12 导出。
+    if (wind::uielement::InvariantBroken(_uiSnapshotDirty != FALSE,
+                                         _uiHostDraws != FALSE,
+                                         _uiHostReadsCandidates != FALSE))
+    {
+        WIND_LOG_WARN(L"uielement: 脏位与「已认定在画」同时成立——调用方不变量已被破坏，"
+                      L"取元信息 getter 的补拉路径此前从未执行过，请复核设计文档 1.4\n");
+    }
     if (!wind::uielement::ShouldRefreshOnGet(_uiSnapshotDirty != FALSE,
                                              contentRead != FALSE,
                                              _uiHostReadsCandidates != FALSE))
@@ -2579,8 +2590,18 @@ void CTextService::NotifyCandidatesVisibilityChanged(BOOL hasCandidates)
             // 按**裸 pid** 记账：同进程另一个 UI 线程首次 Begin 报 flags=0，会把本线程
             // 已经主张过的位从那一份 pid 记账里清掉；本实例因为去重再也不会重报 ⇒
             // 本次激活余下时间都不收窗，且无人纠正（_NoteHostReadCandidates 也因闩已合
-            // 而早退）。每次组合起手重新主张一次即可自愈：异步 8 字节，服务端见状态没变
-            // 就早退，不会多刷一次 UI。
+            // 而早退）。每次组合起手重新主张一次：异步 8 字节，服务端见状态没变就早退，
+            // 不多刷一次 UI。
+            //
+            // ⚠ **这只是把「永久」降级成「到本线程下一次组合起手为止」，不是修好了**：
+            //   - 抹账发生在本线程组合**中途**时，本次组合余下时间仍不收窗；
+            //   - 抹账方若恰是真正在打字的那个线程，本线程可能再也不起组合 ⇒ 永不自愈；
+            //   - 同进程两线程持**不同位**时（A 声明接管、B 只是读过），双方都满足下面
+            //     这个条件，会在各自组合起手互相翻牌，使收窗理由在「声明/推断」之间跳动
+            //     ——而只有推断那条受 compat `host_drawn_candidates` 管 ⇒ 逃生口时灵时不灵。
+            // 根因是载荷里没有 tid、服务端按**裸 pid** 记账（UiElementStatePayload）。
+            // 真正的修法是载荷加 tid、服务端按 (pid, tid) 记账、pid 级判据对同 pid 各线程
+            // 做按位或——那是协议变更，单列跟进，见设计文档 §1.4。
             if (_uiHostDraws || _uiLessThread || _uiHostReadsCandidates)
             {
                 _uiElementStateSent = -1;
