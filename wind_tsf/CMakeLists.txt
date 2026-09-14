@@ -150,6 +150,13 @@ if(WIND_TSF_TESTS)
     endif()
     add_test(NAME skip_key_table COMMAND skip_key_table_test)
 
+    add_executable(uielement_policy_test tests/uielement_policy_test.cpp)
+    target_include_directories(uielement_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(uielement_policy_test PRIVATE /utf-8 /W4)
+    endif()
+    add_test(NAME uielement_policy COMMAND uielement_policy_test)
+
     add_executable(installer_guard_test tests/installer_guard_test.cpp)
     target_include_directories(installer_guard_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
     if(MSVC)

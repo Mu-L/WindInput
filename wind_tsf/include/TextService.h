@@ -2,6 +2,7 @@
 
 #include "Globals.h"
 #include <ctffunc.h> // ITfIntegratableCandidateListUIElement（Dota 2 等自绘候选宿主的必需接口）
+#include "UiElementPolicy.h" // 候选 UI 元素的纯判据（可单测，见 tests/uielement_policy_test.cpp）
 #include "BinaryProtocol.h" // HostWindowKind / HOST_WINDOW_KIND_COUNT for the host window array
 // AsyncCaretResult / CaretProbeKind 按值出现在 OnAsyncCaretRectReady 签名里，需要完整定义。
 // 反向不成立（CaretEditSession.h 只前置声明 CTextService），故无循环包含。
@@ -467,7 +468,12 @@ private:
     // 「宿主在画候选」：声明接管（pbShow=FALSE / Show(FALSE) / UI-less 线程）**或**
     // 实际来读过候选串。后者是推断，core 侧可经 compat 规则 host_drawn_candidates 关掉；
     // 这里不做覆盖——DLL 只负责如实报告，压不压窗由 core 决定。
-    BOOL  _UiElementHostDraws() const { return _uiHostDraws || _uiHostReadsCandidates; }
+    BOOL  _UiElementHostDraws() const
+    {
+        return wind::uielement::HostDraws(_uiHostDraws != FALSE, _uiHostReadsCandidates != FALSE)
+                   ? TRUE
+                   : FALSE;
+    }
     // 取光标坐标是否该整条短路。UI-less / 宿主接管绘制（SDL2 游戏等）时我们不弹自己的
     // 候选 / 组合窗，就**不需要**光标坐标；而向这类宿主反复发 GetTextExt（同步 edit
     // session）在 D3D 独占全屏下会把游戏渲染线程逐次拖死——Dota 2 实测：组合起后进入
@@ -502,8 +508,12 @@ private:
     // 且下一键即恢复。
     BOOL  _UiElementUseSnapshot() const
     {
-        if (_UiElementHostDraws()) return TRUE;
-        return !_uiSnapshot.items.empty() && !_uiSnapshotDirty;
+        return wind::uielement::UseSnapshot(_uiHostDraws != FALSE,
+                                            _uiHostReadsCandidates != FALSE,
+                                            _uiSnapshot.items.empty(),
+                                            _uiSnapshotDirty != FALSE)
+                   ? TRUE
+                   : FALSE;
     }
     void  _ReportUiElementState();        // flags 变化时发 CMD_UIELEMENT_STATE
     BOOL  _RefreshUiElementSnapshot();    // 同步拉取快照并计算 _uiUpdatedFlags；失败清空快照
@@ -514,8 +524,14 @@ private:
     // ⚠ 这个参数不是洁癖：`GetCount` 是 **msctf 自己**也会问的（它据此判断候选 UI
     // 「有没有意义」，Chromium 的 IME-first 调度就靠这个），无条件在那里补拉等于给
     // 每个宿主的每一次按键都加一次宿主 UI 线程上的同步 IPC——正是本次要避免的代价。
-    // 故：闩未合上时只有 GetString 会触发补拉（它同时就是判定点，一调即合闩），
-    // 闩合上之后所有 getter 都补拉，保持一次读取序列内各答案同源。
+    //
+    // ⚠️ **取元信息的 5 个 getter 里那句补拉当前不可达**（`ShouldRefreshOnGet` 在
+    // contentRead=FALSE 时恒回 FALSE）：脏位只在「未认定在画」那一支被置起，而读取闩
+    // 只在 `GetString` 里合上、合闩之前必先补拉并清脏 ⇒ 「脏 + 闩已合」进不来。
+    // 留着是防御性的，真值表单测 `TestUnreachableCells` 把这条不变量钉住了。
+    // ⛔ 别把它写成「闩合上之后所有 getter 都补拉、保证一次读取序列内同源」——
+    // 同源实际来自第三分支的急刷，而**恰恰在合闩那一次读取序列里不成立**
+    // （`GetCount` 那一帧答占位 count=1，见设计文档 §1.4）。
     void  _EnsureUiSnapshotFresh(BOOL contentRead = FALSE);
     // 宿主读了候选串 → 置 sticky 闩并立刻报服务端（它据此收掉我们自己的候选窗）。
     void  _NoteHostReadCandidates();

@@ -29,17 +29,18 @@
 use crate::coordinator::{Coordinator, State};
 use std::sync::Mutex;
 
+use tracing::{debug, info};
+use wind_ipc::protocol::{
+    UIELEMENT_ACTION_ABORT, UIELEMENT_ACTION_FINALIZE, UIELEMENT_ACTION_SET_PAGE,
+    UIELEMENT_ACTION_SET_SELECTION, UiElementPage,
+};
+
 /// compat 里表示「所有应用」的进程名，目前只被 `host_drawn_candidates` 的回落查表认。
 ///
 /// ⛔ 刻意**不**做成 `AppCompat::get_rule` 的通用通配：那会让 `process = "*"` 的一条规则
 /// 把全部字段（初始中英、首显档、定位方式……）一次性套到每个应用头上，是个比本次要解决
 /// 的问题大得多的语义变更。这里只给「推断收窗」这一条判据留一个全局关闭口。
 pub(crate) const HOST_DRAWN_WILDCARD: &str = "*";
-use tracing::{debug, info};
-use wind_ipc::protocol::{
-    UIELEMENT_ACTION_ABORT, UIELEMENT_ACTION_FINALIZE, UIELEMENT_ACTION_SET_PAGE,
-    UIELEMENT_ACTION_SET_SELECTION, UiElementPage,
-};
 
 impl Coordinator {
     /// 消费一次 DLL 的 `CMD_UIELEMENT_STATE`：**两张账一起写完，再统一刷一次 UI**。
@@ -594,6 +595,38 @@ mod tests {
             c.ui_suppressed_by_host(),
             None,
             "逃生口必须落到真正在输入的那个进程上，不能另取一次 active_compat.pid"
+        );
+    }
+
+    /// 两个 pid 都命中且进程名不同时，用的必须是 `focus_pid`（按键来源）那一个。
+    ///
+    /// 这条顺序原本无关紧要（`current_pid_in` 只回 bool），H1 修复把它变成了**载荷**——
+    /// 它现在决定拿谁的名字去查 compat。没有测试钉住的话，有人调换两个分支的先后
+    /// 不会有任何一条变红，而后果是逃生口落到错误的进程上。
+    /// 变异检验：把 `active_compat.pid` 那一支提到前面 ⇒ 本条立刻红。
+    #[test]
+    fn the_key_source_pid_wins_when_both_pids_are_readers() {
+        let (c, _rx) = coord();
+        fill(&c, 5);
+        focus_pid(&c, 1); // active_compat.pid = 1
+        name_pid(&c, 1, "explorer.exe");
+        c.focus_pid.store(42, std::sync::atomic::Ordering::Relaxed);
+        name_pid(&c, 42, "maplestory.exe");
+        c.set_uielement_host_reads(1, true); // 两个都在读取账里
+        c.set_uielement_host_reads(42, true);
+        // 只给按键来源那个配逃生口：生效 ⇒ 说明查名用的是它。
+        compat_rule(
+            &c,
+            wind_config::app_compat::AppCompatRule {
+                process: "maplestory.exe".into(),
+                host_drawn_candidates: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            c.ui_suppressed_by_host(),
+            None,
+            "两个 pid 都命中时应取 focus_pid（按键来源）去查覆盖"
         );
     }
 

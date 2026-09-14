@@ -2495,18 +2495,26 @@ void CTextService::_EnsureUiSnapshotFresh(BOOL contentRead)
 {
     // ⚠ 这是本类唯一一处在 **msctf 的 sink 派发栈内**发生的同步 IPC（UpdateUIElement →
     // 宿主 GetString → 这里），最坏会把宿主 UI 线程按住 READ_TIMEOUT_MS（1500ms），
-    // 期间进程内其它 sink / TIP 一并挂起。两点让它可以接受：
-    //   1. **每次激活至多发生一次**——它只在「脏且尚未合闩」时成立，而这一次调用
-    //      必然合上闩（见 GetString），此后第三分支走 _UpdateUiElementForHost() 急刷，
-    //      dirty 恒为 FALSE，getter 再也不会走到这里；
-    //   2. 真跑满 1500ms 只可能是服务端挂死，那时输入法整体已不可用，不是本路径独有。
+    // 期间进程内其它 sink / TIP 一并挂起。
+    //
+    // 频率上界（2026-09-14 修正，原先写的「每次激活至多一次」**不成立**）：
+    //   - 正常路径确实每次激活至多一次——这次调用会在 GetString 的成功出口合上闩，
+    //     此后第三分支走 _UpdateUiElementForHost() 急刷、dirty 恒为 FALSE，再也走不到；
+    //   - 但闩**只在成功出口合**。GetString 前面两个早退（补拉回空/失败 → 占位；
+    //     uIndex 越界 → E_INVALIDARG）都跳过合闩，于是下一键 dirty 又置真、再付一次。
+    //     真实上界是「快照查询持续失败或回空时，每键一次」，由 IPC 熔断
+    //     （_ShouldAttemptOperation / _RecordFailure）兜住，撑不到持续每键 1500ms。
+    //
     // ⛔ 不要为此调小超时：读超时与 _RecordFailure/Disconnect/熔断是同一套（见
     // IPCClient.h 的 IPCConfig 注释——「超时过短会把偶发慢误判为服务挂死而断连」），
-    // 调小换来的是负载高时误断 IPC + 熔断 3 秒，比顿一下更糟。
-    if (!_uiSnapshotDirty) return;
-    // 还没认定有人在读时，只有「取内容」那一次值得一趟同步 IPC——别的 getter 可能只是
-    // msctf 自己在探问（见头文件里这个参数的说明）。
-    if (!contentRead && !_uiHostReadsCandidates) return;
+    // 调小换来的是负载高时误断 IPC + 熔断 3 秒，比顿一下更糟。上面那条「失败时每键一次」
+    // 恰恰是**不该调小**的又一条理由：熔断才是这条路的正确闸门。
+    if (!wind::uielement::ShouldRefreshOnGet(_uiSnapshotDirty != FALSE,
+                                             contentRead != FALSE,
+                                             _uiHostReadsCandidates != FALSE))
+    {
+        return;
+    }
     _RefreshUiElementSnapshot();
 }
 
@@ -2566,6 +2574,17 @@ void CTextService::NotifyCandidatesVisibilityChanged(BOOL hasCandidates)
             _uiElementShown = bShow;
             _uiHostDraws = !bShow;
             WIND_LOG_DEBUG_FMT(L"BeginUIElement ok id=%u show=%d\n", _uiElementId, (int)bShow);
+            // ⚠ 有位要主张就**强制重报一次**，绕过 _uiElementStateSent 的去重。
+            // CTextService 是每 TSF 线程一个实例、各有一份 _uiElementStateSent，而服务端
+            // 按**裸 pid** 记账：同进程另一个 UI 线程首次 Begin 报 flags=0，会把本线程
+            // 已经主张过的位从那一份 pid 记账里清掉；本实例因为去重再也不会重报 ⇒
+            // 本次激活余下时间都不收窗，且无人纠正（_NoteHostReadCandidates 也因闩已合
+            // 而早退）。每次组合起手重新主张一次即可自愈：异步 8 字节，服务端见状态没变
+            // 就早退，不会多刷一次 UI。
+            if (_uiHostDraws || _uiLessThread || _uiHostReadsCandidates)
+            {
+                _uiElementStateSent = -1;
+            }
             _ReportUiElementState();
             // 规范：回 FALSE 后**必须** UpdateUIElement（快照已在 Begin 前取好，首次全位置位）。
             // 回 TRUE 时规范说可不调——这里仍然调，为的是**把会读的宿主逼出来**：
@@ -2598,7 +2617,8 @@ void CTextService::NotifyCandidatesVisibilityChanged(BOOL hasCandidates)
     }
     else if (hasCandidates && _uiElementId != (DWORD)-1)
     {
-        if (_UiElementHostDraws())
+        if (wind::uielement::ShouldRefreshEagerly(_uiHostDraws != FALSE,
+                                                  _uiHostReadsCandidates != FALSE))
         {
             _UpdateUiElementForHost(); // 拉快照 + 通知宿主重读
         }
