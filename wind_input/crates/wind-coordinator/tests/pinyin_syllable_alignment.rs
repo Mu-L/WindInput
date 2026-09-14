@@ -55,6 +55,32 @@ fn has_pinyin() -> bool {
         .exists()
 }
 
+/// [`texts_of_code`] 要开的那个文件。
+///
+/// ⚠️ 它和 [`has_pinyin`] 查的**不是一回事**：那个是协调器要的方案源（`cn_dicts/*.yaml`），
+/// 这个是 `import_tables` 合并出来的**产物**。测试进程里 `EngineManager` 的 `CACHE_DIR`
+/// 从未初始化，`cache_path` 于是回落到 `source.with_extension()`，产物才落在源文件旁边
+/// （装机后它在可写缓存目录里，不在 schemas 下——别照抄这个路径去别处用）。
+///
+/// 两者会分家：dev 数据树只要缺掉 `rime_frost.dict.yaml` 的任一 `import_tables` 成员
+/// （本机实测缺 `cn_dicts_cell/*` 与 `GB18030-2022`），合并就不产出，而源 yaml 俱在。
+fn merged_dict_path() -> PathBuf {
+    data_dir().join("schemas/pinyin/rime_frost.dict.merged.wdat")
+}
+
+/// 音节归属探针的数据是否就绪。
+///
+/// ⚠️ 2026-09-14 修正：3 条用 [`texts_of_code`] 的测试原先只查 [`has_pinyin`]，于是在
+/// 「源在、合并产物不在」的机器上守卫放行、测试在 `expect("打开真实拼音词库")` 处炸，
+/// 表现为 3 条恒定失败——混在全量结果里，和真回归难以区分（2026-09-13 就因此误报过一次
+/// 「全绿」）。判据必须落在**真正要打开的那个文件**上。
+///
+/// ⛔ 不要改成「打不开就回空集」：`cross_syllable_hits` 会因此恒回空，三条断言全部无条件
+/// 通过——那是把红灯换成假绿，比失败更糟。
+fn has_syllable_probe() -> bool {
+    merged_dict_path().exists()
+}
+
 /// 刻意**不改** completion 配置：本文件测的是出厂默认下的行为。
 fn config() -> Config {
     let mut cfg = Config::default();
@@ -91,7 +117,7 @@ fn candidates_for(input: &str) -> Vec<String> {
 /// 都存在，那样会把合法候选误报成缺陷。首版探针就是这么误报的（`ni` 的最早跨音节位次
 /// 被算成第 11 位，剔除多音字后实为第 35 位）。故调用方一律先排除本音节码下的字。
 fn texts_of_code(code: &str) -> HashSet<String> {
-    let p = data_dir().join("schemas/pinyin/rime_frost.dict.merged.wdat");
+    let p = merged_dict_path();
     let r = wind_dict::datformat::WdatReader::open(&p).expect("打开真实拼音词库");
     r.search(code).into_iter().map(|e| e.text).collect()
 }
@@ -114,6 +140,13 @@ fn cross_syllable_hits(cands: &[String], own: &str, longer: &[&str]) -> Vec<Stri
 fn legal_syllable_excludes_longer_syllable_candidates() {
     if !has_pinyin() {
         eprintln!("跳过：拼音词库不存在");
+        return;
+    }
+    if !has_syllable_probe() {
+        eprintln!(
+            "跳过：音节归属探针词库不存在（{}）——import_tables 未全量合并",
+            merged_dict_path().display()
+        );
         return;
     }
     for (input, own, longer) in [
@@ -154,6 +187,13 @@ fn illegal_syllable_still_prefix_matches() {
         eprintln!("跳过：拼音词库不存在");
         return;
     }
+    if !has_syllable_probe() {
+        eprintln!(
+            "跳过：音节归属探针词库不存在（{}）——import_tables 未全量合并",
+            merged_dict_path().display()
+        );
+        return;
+    }
     let cands = candidates_for("fe");
     let hits = cross_syllable_hits(&cands, "fe", &["fen", "feng", "fei"]);
     assert!(
@@ -173,6 +213,13 @@ fn illegal_syllable_still_prefix_matches() {
 fn fuzzy_layer_still_provides_eng_when_enabled() {
     if !has_pinyin() {
         eprintln!("跳过：拼音词库不存在");
+        return;
+    }
+    if !has_syllable_probe() {
+        eprintln!(
+            "跳过：音节归属探针词库不存在（{}）——import_tables 未全量合并",
+            merged_dict_path().display()
+        );
         return;
     }
     let mut cfg = config();
