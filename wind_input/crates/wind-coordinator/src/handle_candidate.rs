@@ -2636,7 +2636,10 @@ impl Coordinator {
             Some(t) => t.to_string(),
             None => self.maybe_convert(state, text),
         };
-        if self.english_appends_space(source, text, &state.input_buffer) {
+        if self.english_appends_space(source, text, crate::preedit_cursor::cased_or_buffer(
+                &state.input_buffer,
+                &state.input_buffer_cased,
+            )) {
             out.push(' ');
         }
         state.input_buffer.clear();
@@ -2849,6 +2852,24 @@ impl Coordinator {
     ///
     /// ★ 第二个判据落在**上屏文本是否等于当前输入串**，而不是「这条候选有没有 `source`」
     /// ——后者是实现细节，前者才是「这是不是原码」的定义。
+    ///
+    /// ⚠️ `input` 必须是**所打原码**，即 `cased_or_buffer(input_buffer, input_buffer_cased)`
+    /// ——不能直接传 `state.input_buffer`（t122）。后者恒为全小写：英文方案下 Shift+字母走
+    /// 主路字母臂，大写只进影子串（见 `handle_lifecycle` 临英门禁处的「★ 英文方案下不进临英」）。
+    /// 传小写缓冲时，打 `The` 会两个分支同时落空 ⇒ 首字母大写的词一律静静地不补空格。
+    ///
+    /// 落到本判据上的那条首选是 `english_head_candidates` 用 `raw`（同一个 `cased_or_buffer`）
+    /// **直接构造**的原文候选，`source` 为 `None`。注意**不是**被 `apply_english_case` 投影过的
+    /// 词库候选——那条在上游 1452 行的精确去重里已被头部候选吃掉。于是触发开关是
+    /// `raw_candidate`（默认开），**不是** `case_follow_input`：`raw_candidate = false` 时首选是
+    /// 词库候选、`source == English`、第一分支直接命中，本就补空格。
+    ///
+    /// 两侧用同一个 `cased_or_buffer` 取原码，故 `==` 逐字节相等，判据继续严格表达
+    /// 「上屏的就是所打原码」。⚠️ **不要改成 `eq_ignore_ascii_case`**：那是逆命题谬误
+    /// ——「大小写无关相等」只说明候选是输入串的**某个**大小写变体，而变体不止原码一个，
+    /// 会连 `case_variants` 的变形候选（`hel`→`HEL`）、CapsLock 档位候选、以及缩写类短语
+    /// （打 `usa` 选中 `USA`，`source == Phrase`）一并补上空格 —— 最后一条正好违反上面
+    /// 第一条理由里写的「短语等其它来源不该补空格」。
     ///
     /// ⚠️ 非英文方案不会误中：`english_space_enabled` 已经要求 `active_is_english()`。
     pub(crate) fn english_appends_space(
@@ -3096,7 +3117,10 @@ impl Coordinator {
             //
             // 补在 s2t 之后：空格不参与简繁转换，且提前补会让 STPhrases 的词级最长匹配断在
             // 空格上。
-            if self.english_appends_space(cand.source, &cand.text, &state.input_buffer) {
+            if self.english_appends_space(cand.source, &cand.text, crate::preedit_cursor::cased_or_buffer(
+                &state.input_buffer,
+                &state.input_buffer_cased,
+            )) {
                 out.push(' ');
             }
             // 下一轮联想的**上文**：取简体域的完整文本，而不是上屏的 `out`。

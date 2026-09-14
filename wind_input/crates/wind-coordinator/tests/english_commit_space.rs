@@ -16,7 +16,7 @@ use std::sync::Arc;
 use wind_bridge::handler::{CommitRequestData, KeyAction, KeyEventData, MessageHandler};
 use wind_config::Config;
 use wind_coordinator::Coordinator;
-use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP};
+use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_SHIFT};
 
 const VK_SPACE: u32 = 0x20;
 const VK_RETURN: u32 = 0x0D;
@@ -59,6 +59,15 @@ fn press_letter(coord: &Coordinator, c: char) -> KeyAction {
     coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN))
 }
 
+/// Shift+字母：英文方案下走主路字母臂，大写落进影子串 `input_buffer_cased`，
+/// `input_buffer` 保持小写（见 `handle_lifecycle` 临英门禁处的 ★ 英文方案下不进临英）。
+fn press_letter_shift(coord: &Coordinator, c: char) -> KeyAction {
+    let vk = (c.to_ascii_uppercase() as u32) & 0xFF;
+    let mut ev = key_event(vk, EVENT_KEY_DOWN);
+    ev.modifiers = MOD_SHIFT;
+    coord.handle_key_event(&ev)
+}
+
 fn type_word(coord: &Coordinator, s: &str) {
     for c in s.chars() {
         press_letter(coord, c);
@@ -90,6 +99,39 @@ fn space_select_appends_space() {
 
     let text = commit_text(&coord.handle_key_event(&key_event(VK_SPACE, EVENT_KEY_DOWN)));
     assert_eq!(text, format!("{top} "), "空格选首选后应补一个空格");
+}
+
+/// 首字母大写时**选中首选**上屏，同样要补空格（t122）。
+///
+/// 与 `space_select_appends_space` 只差一个 Shift，断言同形。**这条才是 t122 的复现。**
+///
+/// 它落在 `english_appends_space` 上（有候选 → 选中上屏）。此刻的首选是
+/// `english_head_candidates` 用「所打原码」直接构造的原文候选（`source` 为 `None`，
+/// 词库里字面相同的那条已在上游被精确去重吃掉），于是第一分支不命中；第二分支比
+/// `text == input`，`input` 若传成全小写的 `state.input_buffer` 就永不相等 —— 两头落空。
+///
+/// 触发开关是 `raw_candidate`（默认开）而**不是** `case_follow_input`：
+/// `raw_candidate = false` 时首选是词库候选、`source == English`，第一分支直接命中。
+///
+/// 反向验证（2026-09-14 实跑）：把调用点的 `cased_or_buffer(...)` 换回 `&state.input_buffer`，
+/// 本测试即变红（其余 12 条不动）。
+#[test]
+fn space_select_appends_space_when_capitalized() {
+    if !has_english_schema() {
+        return;
+    }
+    let coord = Coordinator::new_headless(english_config(true), Some(&data_dir()));
+
+    press_letter_shift(&coord, 'h');
+    type_word(&coord, "el");
+    let top = coord.debug_page_texts().first().cloned().expect("应有候选");
+    assert!(
+        top.starts_with('H'),
+        "前提：首选应已按输入投影成首字母大写，实际: {top}"
+    );
+
+    let text = commit_text(&coord.handle_key_event(&key_event(VK_SPACE, EVENT_KEY_DOWN)));
+    assert_eq!(text, format!("{top} "), "首字母大写选首选后应补一个空格");
 }
 
 /// 反向对照：开关关闭时**不得**补空格。
@@ -183,6 +225,37 @@ fn raw_code_space_commit_appends_space() {
 
     let text = commit_text(&coord.handle_key_event(&key_event(VK_SPACE, EVENT_KEY_DOWN)));
     assert_eq!(text, format!("{nonsense} "), "空格上屏原码后应补一个空格");
+}
+
+/// 首字母大写时，「空格上屏原码」的**空码兜底分支**照样补空格。
+///
+/// ⚠️ **这条不是 t122 的复现**（复现见 `space_select_appends_space_when_capitalized`）。
+/// 它走的是 `message_handler` 里那条无候选兜底路径，判据只有一句 `english_space_enabled()`
+/// ——不过候选级判据，所以缺陷期它就是绿的。留着是为了钉住「这条通路对大小写不敏感」，
+/// 免得日后有人把候选级判据一并塞进这里。
+///
+/// 我最初误把它当成 t122 的复现，它一绿就差点据此判定「根因不是大写」。记在这里。
+#[test]
+fn raw_code_space_commit_appends_space_when_capitalized() {
+    if !has_english_schema() {
+        return;
+    }
+    let mut cfg = english_config(true);
+    cfg.schema.english.raw_candidate = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    // 与小写那条同一个无候选串，只把首字母改成大写输入。
+    let nonsense = "qwxzjv";
+    press_letter_shift(&coord, 'q');
+    type_word(&coord, &nonsense[1..]);
+    assert_eq!(
+        coord.debug_candidate_count(),
+        0,
+        "测试前提失效：{nonsense} 现在有候选了，请换一个无候选的串"
+    );
+
+    let text = commit_text(&coord.handle_key_event(&key_event(VK_SPACE, EVENT_KEY_DOWN)));
+    assert_eq!(text, "Qwxzjv ", "首字母大写的原码上屏后应补一个空格");
 }
 
 /// 回车上屏原码 **不补**空格——刻意的不对称，不是漏接。
