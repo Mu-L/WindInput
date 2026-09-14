@@ -126,6 +126,15 @@ target_sources(${TSF_TARGET_NAME} PRIVATE ${CMAKE_BINARY_DIR}/${TSF_TARGET_NAME}
 # 这两个是被刻意剥出来的纯逻辑（不含任何 Win32 头，时钟与进程存活由调用方传入），
 # 所以能测。PairEngine、ClassifyInputKey 这类纯判据日后可照同一条路补进来。
 #
+# ⚠️ 覆盖边界：这里测的只是「判据」，不是「取数」。以 InstallerGuard 为例，
+# ShouldBlockStart / ParseOwner / IsOlderThan 全覆盖，但 IPCClient.cpp 里真正读注册表、
+# 开进程句柄的那半边（_InstallerGuardBlocks / IsOwnerAlive）一行也测不到——把
+# ERROR_INVALID_PARAMETER 写成 ERROR_ACCESS_DENIED、把 KEY_WOW64_64KEY 去掉，
+# 这里不会有任何一条变红。那半边只能上真机验，做法（2026-09-14 实跑过，8 个场景全过）：
+# 把那两个函数用 sed 按行号从 IPCClient.cpp 机械抽成一个探针 exe（日志与类壳换掉，
+# 代码原文不动），在 Windows 上摆出各种 HKLM\Software\<app>\InstallerRunning[Owner]
+# 状态直接跑它。别手抄那两个函数——手抄的副本验的是副本。
+#
 # 本机跑（不需要 MSVC，msys2 的 g++ 即可，这是主要跑法）：
 #   g++ -std=c++17 -Iwind_tsf/include -o skip_test wind_tsf/tests/skip_key_table_test.cpp && ./skip_test
 # 经 CMake 跑（需 MSVC，本机无，未实跑；但 configure 阶段每次构建都会走到，语法错
