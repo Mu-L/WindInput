@@ -2529,6 +2529,7 @@ dependencies = [
  "wind-config",
  "wind-dict",
  "wind-store",
+ "windows",
 ]
 
 [[package]]

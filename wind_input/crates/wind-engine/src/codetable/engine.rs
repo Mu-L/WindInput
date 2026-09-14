@@ -92,6 +92,14 @@ pub struct CodeTableEngine {
     /// 方案级引擎固定参数，由协调器经 `EngineManager::active_input_chars()` 按方案取用。
     /// 挂在引擎上，方案切换时自然跟着换，不会像全局快照那样读到别的方案的集合。
     charset: wind_config::CodeCharSet,
+    /// 本方案**声明过**的扩展词库 id（含未启用、因而没被加载的那些）。
+    ///
+    /// 只为 [`Engine::set_dict_enabled`] 分辨「这个 id 是不是我的」而存在。混输引擎会把
+    /// 同一次调用转发给 primary / secondary / english 三个子引擎，码表子引擎照样会收到
+    /// 拼音库的 id —— 没有这张表就只能靠「摘层是否命中」来猜，而「我的库但惰性加载没装」
+    /// 与「压根不是我的库」摘层同样都命中不了，两者必须分开：前者是「已达成」，
+    /// 后者是「不认识，该由别人处理或重建」。
+    own_extra_dicts: std::collections::HashSet<String>,
     /// 整句解码器（`opts.sentence_input` 关闭时为 `None`）。
     ///
     /// 它内部两张表都是 `OnceLock` 懒构建的全表扫描——关闭的方案连这个结构都不建；
@@ -116,12 +124,22 @@ impl CodeTableEngine {
             // 默认 `a-z`，与历史硬编码 `VK_A..=VK_Z` 逐键等价。构建方按方案配置
             // 再 `with_charset` 覆盖——如此所有既有调用点（含测试）无需改动。
             charset: wind_config::CodeCharSet::default_alpha(),
+            // 默认空集 ⇒ `set_dict_enabled` 对任何 id 都回 false（「不认识」），
+            // 构建方用 `with_own_extra_dicts` 按方案填。既有调用点（含测试）无需改动：
+            // 空集只会让热插拔退化成「失效重建」，不会给出错误答案。
+            own_extra_dicts: std::collections::HashSet::new(),
         }
     }
 
     /// 注入码元字符集。缺省即内置默认 `a-z`。
     pub fn with_charset(mut self, charset: wind_config::CodeCharSet) -> Self {
         self.charset = charset;
+        self
+    }
+
+    /// 登记本方案声明过的扩展词库 id（含未启用的）。见 [`Self::own_extra_dicts`]。
+    pub fn with_own_extra_dicts<I: IntoIterator<Item = String>>(mut self, ids: I) -> Self {
+        self.own_extra_dicts = ids.into_iter().collect();
         self
     }
 
@@ -273,10 +291,39 @@ fn decide_auto_commit(
 }
 
 impl Engine for CodeTableEngine {
-    /// 热插拔扩展词库：翻 composite 中 `codetable-extra-<id>` 层的 enabled 标志。
+    /// 热插拔扩展词库。**禁用摘层、启用交给重建**，两边不对称，各有理由：
+    ///
+    /// **禁用 → 从 composite 摘掉 `codetable-extra-<id>` 层**，而不是翻它的 enabled 标志。
+    /// 翻标志只让它不再出候选，`CachedDict` 的 `Arc` 仍挂在层上 —— Windows 下 wdat 被 mmap
+    /// 期间删不掉（见 `wind_dict::reader_pool` 的模块注释），用户禁用了词库却依然清不掉
+    /// cache 里那个文件（t107）。摘层会 drop 掉该层，`Arc` 计数随之下降；若无其它方案引用
+    /// 同一个缓存文件（`reader_pool` 存的是 `Weak`，不会拖住），mmap 即刻解除、文件可删。
+    ///
+    /// **启用 → 返回 false**。未启用的词库压根没加载（见
+    /// `EngineManager::load_codetable_layers` 的惰性加载），层不存在，这里无从恢复；
+    /// 调用方 `set_dict_enabled_live` 收到 false 会失效整个方案，下次使用时重建 ——
+    /// 那一趟才真正去读文件、必要时建 wdat。代价是启用大词库有一次可感知的重建延迟，
+    /// 这是「禁用即不占资源」换来的，取舍见 t107。
     fn set_dict_enabled(&self, dict_id: &str, enabled: bool) -> bool {
+        // ★ 先问「这个 id 是不是我的」。混输会把同一次调用转发给三个子引擎，码表子引擎
+        // 照样会收到拼音库的 id；不先筛掉，下面那个 `true` 就会冒充「我处理了」，
+        // 让 `MixedEngine` 的 `a || b || c` 恒真 —— 真正承载该库的那个子引擎（比如拼音，
+        // 它不支持热插拔）明明需要失效重建，却被这个假阳性掩盖掉。
+        if !self.own_extra_dicts.contains(dict_id) {
+            return false;
+        }
+        if enabled {
+            // 惰性加载下该层压根没建，这里无从恢复 —— 交调用方失效重建。
+            return false;
+        }
+        // 走到这里：**本方案的**扩展库，且要禁用它。返回值语义是「目标态是否已达成」
+        // 而非「是否摘到了层」—— 本来就没加载（惰性加载跳过了它）同样算达成。
+        // 若这里回 false，`set_dict_enabled_live` 会判成「翻不动」而失效整个方案，
+        // 重建时把刚摘掉的其它扩展层一并装回来：实测踩过，wubi86 三个扩展库里 xzqy
+        // 未启用，关闭三者后「甘蓝菜」仍在。
         self.dm
-            .set_layer_enabled(&format!("codetable-extra-{dict_id}"), enabled)
+            .unregister_layer(&format!("codetable-extra-{dict_id}"));
+        true
     }
 
     /// 空码枚举：空前缀查询从根遍历整表（datformat::search_prefix），已按 weight 降序 +
@@ -661,6 +708,50 @@ mod tests {
         dm.register_layer(Box::new(SystemDictLayer::new(build(ext), "ext")));
         let e = CodeTableEngine::new(4, CommitOptions::default(), dm.clone());
         (e, dm)
+    }
+
+    /// `set_dict_enabled` 必须先分辨「这个 id 是不是我的」，再谈处理（t107 的回归守门）。
+    ///
+    /// # 为什么这一步不能省
+    ///
+    /// `MixedEngine::set_dict_enabled` 把同一次调用转发给 primary / secondary / english
+    /// 三个子引擎并取 `a || b || c`。码表子引擎因此照样会收到**拼音库**的 id。若它对任何
+    /// id 都回 true（早先的写法就是这样），那个或运算恒真 ⇒ 调用方判定「已生效」⇒
+    /// 真正承载该库、且**不支持**热插拔的拼音子引擎所需要的失效重建被整个吞掉：
+    /// 用户禁用拼音方案的扩展库，独立方案下次生效，混输里却继续出该库的候选，直到重启。
+    ///
+    /// 启用方向一律回 false：惰性加载之后未启用的库根本没建层，这里无从恢复，
+    /// 必须交调用方失效重建 —— 这也是为什么调用方**不能**再拿返回值给启用路径做路由。
+    #[test]
+    fn set_dict_enabled_only_claims_own_dicts() {
+        let (e, _dm) = engine_two_dicts(&[("a", "工", 100)], &[("a", "工", 5000)]);
+        let e = e.with_own_extra_dicts(["mine".to_string()]);
+
+        assert!(
+            e.set_dict_enabled("mine", false),
+            "本方案声明过的库：禁用应认领（摘到与否都算达成 —— 惰性加载可能本就没装它）"
+        );
+        assert!(
+            !e.set_dict_enabled("not-mine", false),
+            "**不是**本方案的库：必须回 false，否则混输的 a||b||c 会恒真、掩盖真正承载方的重建需求"
+        );
+        assert!(
+            !e.set_dict_enabled("mine", true),
+            "启用方向一律回 false：层没建过，这里无从恢复，交调用方失效重建"
+        );
+        assert!(
+            !e.set_dict_enabled("not-mine", true),
+            "既不是我的、又是启用，更该回 false"
+        );
+    }
+
+    /// 默认（未登记任何 own_extra_dicts）时对一切 id 回 false —— 退化成「失效重建」，
+    /// 可能多跑一次重建，但不会给出错误答案。既有调用点与测试因此无需改动。
+    #[test]
+    fn set_dict_enabled_defaults_to_disowning_everything() {
+        let (e, _dm) = engine_two_dicts(&[("a", "工", 100)], &[("a", "工", 5000)]);
+        assert!(!e.set_dict_enabled("ext", false));
+        assert!(!e.set_dict_enabled("ext", true));
     }
 
     /// ★★★ 跨词库同词条合并的主键是 `(code, text)`，不是 `text`。

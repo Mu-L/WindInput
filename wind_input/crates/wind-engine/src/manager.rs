@@ -2337,9 +2337,15 @@ impl EngineManager {
             .collect()
     }
 
-    /// 运行时启停某方案的扩展词库：对**已加载引擎**即时翻对应系统层的 enabled 标志
-    /// （无需重建/重熔大词库）；翻不动的已加载引擎（拼音族不支持热翻、或该层未进 composite）
-    /// 直接失效，下次使用按已落盘的 override 重建；未加载的方案此处不做事（下次构建生效）。
+    /// 运行时启停某方案的扩展词库。**禁用与启用不对称**（t107 之后）：
+    ///
+    /// - **禁用**：对已加载引擎即时**摘掉**那一层（`Engine::set_dict_enabled`），无需重建。
+    ///   摘层同时释放该词库的 `CachedDict` —— 这是让 Windows 下被 mmap 的 wdat 能被删除的
+    ///   唯一途径，也是禁用必须摘层而非翻标志位的原因。
+    /// - **启用**：未启用的词库压根没加载（`load_codetable_layers` 惰性加载），无从即时恢复，
+    ///   一律失效整个方案、下次使用时重建。代价是启用大词库有一次可感知的延迟。
+    ///
+    /// 拼音族不支持热翻，两个方向都走失效重建。未加载的方案此处不做事（下次构建生效）。
     /// 启用集变化会影响反查索引/编码提示（基于启用词库合并），故一并失效之使下次重算。
     /// 返回是否对已加载引擎生效（热翻或已失效待重建，二者都无需重启）。
     /// **注意**：调用方须先 [`persist_schema_override`] 持久化，否则重启/重建后状态丢失。
@@ -2361,30 +2367,49 @@ impl EngineManager {
         // 独立方案与把它当成员的混输方案同一条规则：翻得动就翻，翻不动就失效待重建。
         // 只失效混输不失效独立方案的话，同一个拼音扩展库在混输里下次输入就生效、
         // 在独立拼音方案里却要重启，两个方案表现不一致。
-        let mut hit = false;
-        if let Some(e) = engine {
-            if e.set_dict_enabled(dict_id, enabled) {
-                hit = true;
-            } else {
+        if enabled {
+            // ★ **启用一律失效重建，且必须扇出到每一个 mixed 依赖方。**
+            //
+            // 惰性加载之后，未启用的库根本没建层，`set_dict_enabled` 在启用方向恒回 false
+            // —— 没有「热恢复」这条路可走。于是**不能**再拿返回值去路由：下面禁用路径那道
+            // `schema_id != ENGLISH_SCHEMA` 豁免（前提是「转发不到是常态」）会与这个恒 false
+            // 叠加，让英文扩展库（`en_ext`，出厂启用、设置页可点）的启用在混输里**永远**
+            // 不失效 —— 独立 english 方案下次用会重建、正常，而混输里那份**内联构造的**
+            // english 子引擎（与 `engines` 表里那份不是同一个实例）一直拿不到它，
+            // 表现就是本函数上面注释写的「关了没反应，顺手改别的设置又好了」。
+            //
+            // 对「mixed 里根本没建 english 子引擎」（`enable_english` 关着）的情形，这一趟
+            // 失效是多余的 —— 但多余只是一次重建，而漏掉是功能不生效，两者不对等。
+            self.invalidate_schema(schema_id);
+            for (mixed_id, _) in self.loaded_mixed_dependents(schema_id) {
+                info!("启用词库 {}：失效混输方案 {} 待重建", dict_id, mixed_id);
+                self.invalidate_schema(&mixed_id);
+            }
+        } else if let Some(e) = engine {
+            if !e.set_dict_enabled(dict_id, false) {
                 info!(
                     "方案 {} 不支持即时翻转词库 {}，已失效待重建",
                     schema_id, dict_id
                 );
                 self.invalidate_schema(schema_id);
-                hit = true;
             }
         }
+        // 引擎不在表里也算数（故本函数**恒返回 true**，见函数末尾）：那意味着「从未加载」，
+        // 或者「刚被本批次前一次调用失效掉」—— 后者是常态，设置页一次勾选多个扩展库会
+        // 逐个调进来，启用走的是失效待重建那条路，于是第二个 id 进来时引擎已经没了。
+        // 两种情况结局相同：下次构建按已落盘的 override 生效，同样无需重启。
+        // 若这里回 false，批量启用时除第一个以外全部报「没生效」，而实际全都会生效
+        // —— 调用方（`web_schema_*` 的 `live` 字段）据此给用户的提示就是反的。
+        // 禁用方向才走转发：承载该库的那个子引擎摘层即释放，其余子引擎因
+        // `own_extra_dicts` 不含这个 id 而明确回 false，不会冒充「我处理了」。
         for (mixed_id, e) in self.loaded_mixed_dependents(schema_id) {
-            if e.set_dict_enabled(dict_id, enabled) {
-                hit = true;
-            } else if schema_id != ENGLISH_SCHEMA {
+            if !enabled && !e.set_dict_enabled(dict_id, false) && schema_id != ENGLISH_SCHEMA {
                 // english 子引擎可能根本没建（enable_english 关着），转发不到是常态，不失效。
                 info!(
                     "混输方案 {} 内的成员 {} 不支持即时翻转词库 {}，已失效待重建",
                     mixed_id, schema_id, dict_id
                 );
                 self.invalidate_schema(&mixed_id);
-                hit = true;
             }
         }
         // 反查索引依赖「启用词库合并」，启用集变了须失效（懒重建）。
@@ -2398,7 +2423,9 @@ impl EngineManager {
             .single_char_codes
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
-        hit
+        // 恒 true：上面每条路都以「无需重启即可生效」收尾。保留返回值是为了兼容既有调用方
+        // （web 的 `live` 字段），也给将来真出现「必须重启」的分支留个位置。
+        true
     }
 
     /// 删除某方案 override 层并使其引擎缓存失效。返回是否删除了文件。
@@ -4343,7 +4370,8 @@ impl EngineManager {
             let commit_opts = crate::codetable::CommitOptions::default();
             info!("Built english engine {}", schema_id);
             return Some(Box::new(crate::english::EnglishEngine::new(
-                CodeTableEngine::new(mcl, commit_opts, Arc::new(dm)),
+                CodeTableEngine::new(mcl, commit_opts, Arc::new(dm))
+                    .with_own_extra_dicts(Self::declared_extra_dict_ids(&schema)),
             )));
         }
 
@@ -4561,7 +4589,9 @@ impl EngineManager {
                 );
             }
             Some(Box::new(Self::attach_sentence_freq(
-                CodeTableEngine::new(mcl, commit_opts, Arc::new(dm)).with_charset(charset),
+                CodeTableEngine::new(mcl, commit_opts, Arc::new(dm))
+                    .with_charset(charset)
+                    .with_own_extra_dicts(Self::declared_extra_dict_ids(&schema)),
                 commit_opts.sentence_input,
                 &schemas,
             )))
@@ -4660,6 +4690,19 @@ impl EngineManager {
         fallback
     }
 
+    /// 方案**声明过**的扩展词库 id（含未启用的；主库不在内，它没有 `codetable-extra-` 层）。
+    ///
+    /// 供 `CodeTableEngine::set_dict_enabled` 分辨「这个 id 是不是我的」。必须包含未启用的
+    /// —— 惰性加载后它们没有层，但禁用它们同样属于「本方案的事、且目标已达成」。
+    fn declared_extra_dict_ids(schema: &Schema) -> Vec<String> {
+        schema
+            .dictionaries
+            .iter()
+            .filter(|d| !d.default && !d.path.is_empty())
+            .map(|d| d.id.clone())
+            .collect()
+    }
+
     fn load_codetable_layers(schema: &Schema, schemas_dir: &Path) -> Vec<CodetableLayer> {
         let resolve =
             |rel: &str| -> std::path::PathBuf { Self::resolve_dict_file(rel, schemas_dir) };
@@ -4707,12 +4750,22 @@ impl EngineManager {
             }
             None => return Vec::new(),
         }
-        // 扩展库（含禁用的，全部加载常驻，供运行时热插拔）。
+        // 扩展库：**只加载启用的**（t107）。
+        //
+        // 此前是「含禁用的全部加载常驻，供运行时热插拔」—— 热插拔确实快（只翻个标志位，
+        // 不必重熔大词库），但代价是禁用的库照样读盘、照样在 cache 里建出 wdat、照样被
+        // mmap 占着，于是用户「关掉了这个码表」之后既看不见它、又删不掉它的缓存文件。
+        // 现在改为惰性：禁用的库不读、不建缓存、不映射；用户启用它时
+        // `set_dict_enabled` 返回 false → 方案失效 → 下次使用重建，那一趟才去加载。
         for (i, e) in usable.iter().enumerate() {
             if i == main_idx {
                 continue;
             }
             let enabled = e.is_enabled();
+            if !enabled {
+                info!("  codetable extra: {} (id={}, 未启用，跳过加载)", e.path, e.id);
+                continue;
+            }
             if let Some(d) = load_one(e) {
                 info!(
                     "  codetable extra: {} (id={}, enabled={}, {} entries)",

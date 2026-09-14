@@ -39,10 +39,16 @@ impl CompositeDict {
         layers.sort_by_key(|l| l.layer_type() as u8);
     }
 
-    /// 按名注销词典层
-    pub fn unregister_layer(&self, name: &str) {
+    /// 按名注销词典层，返回是否真的摘掉了。
+    ///
+    /// 摘层会 drop 掉那个 `Box<dyn DictLayer>`，连带释放它持有的 `CachedDict`
+    /// —— 对 mmap 词库这是**释放文件句柄的唯一途径**（Windows 下文件被 mmap 期间
+    /// 删不掉，见 `reader_pool` 的模块注释）。返回值用于区分「摘掉了」与「本就没有」。
+    pub fn unregister_layer(&self, name: &str) -> bool {
         let mut layers = self.layers.write().unwrap();
+        let before = layers.len();
         layers.retain(|l| l.name() != name);
+        layers.len() != before
     }
 
     /// 运行时启停某层（按名）：用于码表扩展词库热插拔，无需重建引擎。

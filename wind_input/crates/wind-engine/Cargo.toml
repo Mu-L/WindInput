@@ -15,8 +15,17 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 
+[target.'cfg(windows)'.dev-dependencies]
+# 只给「禁用词库后文件不再被占用」那条 e2e 用：判据必须走 `DeleteFileW`。
+# Rust std 的 `remove_file`/`rename` 在新版 Windows 上不被 mmap 阻止 —— 实测连必定被映射的
+# 主库 wdat 都能改名，用它们根本测不出用户遇到的占用。
+windows = { workspace = true }
+
 [dev-dependencies]
 wind-config = { path = "../wind-config" }
+# 供集成测试按**生产同源**的规则算缓存路径（`cache_ns`）——手工拼 namespace/stem
+# 已经错过一次：把随包分发的 `<源>.dict.wdat` 当成了运行时缓存，测试因此测了个空。
+wind-dict = { path = "../wind-dict" }
 
 [lints]
 workspace = true

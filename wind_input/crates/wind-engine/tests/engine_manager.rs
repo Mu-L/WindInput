@@ -378,11 +378,204 @@ fn test_codetable_extra_hot_toggle() {
         "主库词不受扩展开关影响"
     );
 
-    // 热重新开启 → '甘蓝菜' 回来
+    // 重新开启 → '甘蓝菜' 回来。
+    //
+    // ⚠️ 这里的 `assert!` 自 t107 起已是**空转**：`set_dict_enabled_live` 现在恒返回 true
+    // （每条路都以「无需重启即可生效」收尾，见该函数末尾注释）。真正的判据是下面那句
+    // `has_extra` —— 开启走的是「失效整方案 + 下次使用重建」，不再是热翻标志位，
+    // 所以它验的是「重建后该库回到候选里」。断言留着只为将来真出现「必须重启」的分支。
     for id in &extra_ids {
         assert!(mgr.set_dict_enabled_live("wubi86", id, true));
     }
     assert!(has_extra(&mgr), "热开启扩展后 '甘蓝菜' 应回来");
+}
+
+/// 下面两条测试都动**真实缓存目录**（`%LOCALAPPDATA%/WindInput/cache`，与生产 `CACHE_DIR`
+/// 同源，**不是**临时目录 —— `CACHE_DIR` 是进程级 `OnceLock`，测试无从改写它）。
+/// 一条会删 district 的 wdat，另一条的前提探测在「不阻止删除」的机器上会删掉主库 wdat，
+/// 而前一条正好拿「主库 wdat 存在」当前提 —— 同一个测试二进制内多线程并发时会概率性红，
+/// 还会报成「加载链整个坏了」。串行化，窗口窄的竞态最难查。
+static CACHE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 运行时缓存路径 —— 与生产同源（`EngineManager::cache_path` 走的就是这两个函数）。
+///
+/// ⚠️ **不要用 `src.with_extension("wdat")`**：那是 assemble 时随包分发的产物
+/// （`<源>.dict.wdat`，供 wdat-only 模式），与运行时缓存是两回事。运行时缓存在
+/// `%LOCALAPPDATA%/WindInput/cache/<namespace>/<stem>.wdat`。这里踩过一次：查错了路径，
+/// 于是「去掉惰性加载」的变异下测试照样绿 —— 测了个空。
+fn runtime_wdat(src: &std::path::Path) -> Option<PathBuf> {
+    let root = wind_config::Config::cache_dir()?;
+    let stem = wind_dict::cache_ns::cache_stem(src);
+    Some(wind_dict::cache_ns::cache_path_in(
+        &root,
+        src,
+        &format!("{stem}.wdat"),
+    ))
+}
+
+/// 未启用的扩展词库**不该被加载**，于是也不该在缓存里留下 wdat（t107）。
+///
+/// 缺陷期 `load_codetable_layers` 无条件加载全部扩展库（注释写着「含禁用的，全部加载常驻，
+/// 供运行时热插拔」），于是用户关掉的码表照样读盘、照样建出 wdat、照样被 mmap 占着 ——
+/// 既看不见它，又删不掉它的缓存文件。
+///
+/// 材料是现成的：wubi86 的「行政区域」库出厂 `default_enabled = false`。
+///
+/// ⚠️ 必须同时断言**主库缓存仍在、且主库出得了候选**：否则「整条加载链坏掉」也能让
+/// 后面那个断言通过，那是最坏的一种假绿。
+#[test]
+fn disabled_extra_dict_leaves_no_wdat_cache() {
+    let _serial = CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") {
+        eprintln!("跳过：无 wubi86 schema");
+        return;
+    }
+    let src = dir.join("schemas/wubi86/wubi86_jidian_extra_district.dict.yaml");
+    let main_src = dir.join("schemas/wubi86/wubi86_jidian.dict.yaml");
+    if !src.exists() || !main_src.exists() {
+        eprintln!("跳过：该数据集无「行政区域」扩展库或主库");
+        return;
+    }
+    let (Some(wdat), Some(main_wdat)) = (runtime_wdat(&src), runtime_wdat(&main_src)) else {
+        eprintln!("跳过：本机取不到缓存根");
+        return;
+    };
+
+    // 清掉缺陷期遗留的产物, 让「是否重新生成」成为干净的判据。
+    let _ = std::fs::remove_file(&wdat);
+    let fp = {
+        let mut t = wdat.clone().into_os_string();
+        t.push(".fp");
+        PathBuf::from(t)
+    };
+    let _ = std::fs::remove_file(&fp);
+
+    let cfg = make_config(&["wubi86"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+    // 真正把引擎建出来（构造是惰性的），否则什么都没加载、断言无意义。
+    let cands = mgr.convert("aaaa", 20).candidates;
+    assert!(
+        !cands.is_empty(),
+        "前提：主库应能出候选，否则下面测的是「整条链没跑」而非本改动"
+    );
+    assert!(
+        main_wdat.exists(),
+        "前提：主库缓存应生成 —— 它不在说明加载链整个坏了: {}",
+        main_wdat.display()
+    );
+
+    assert!(
+        !wdat.exists(),
+        "未启用的扩展库不该被加载, 更不该留下 wdat 缓存: {}",
+        wdat.display()
+    );
+}
+
+/// 用 `DeleteFileW` 删文件 —— 与用户在资源管理器里删走的是同一个调用。
+///
+/// 不能用 `std::fs::remove_file`：它在新版 Windows 上走 POSIX 删除语义，对仍被 mmap 的
+/// 文件照样成功，「文件被占用」这件事根本测不出来。
+#[cfg(windows)]
+fn delete_file_win32(p: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    let w: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    unsafe { windows::Win32::Storage::FileSystem::DeleteFileW(PCWSTR(w.as_ptr())) }
+        .map_err(|e| e.to_string())
+}
+
+/// **Windows 专属**：禁用扩展词库后，它的 wdat 缓存必须能被删掉（t107 的核心诉求）。
+///
+/// 楼主报的原话就是「文件被占用删不掉」。Linux 上 mmap 不阻止 unlink，删除恒成功，
+/// 这条在那里测不出任何东西 —— 故 `cfg(windows)`，只在真机/编译机上跑。
+///
+/// 三步各自带判据，尤其第 ① 步**不能跳过**：
+/// ① 引擎持有该库期间删除**应当失败**。若这一步竟成功，说明该库压根没走 mmap（或本机
+///    行为不同），后两步就失去意义 —— 那时必须显式失败，而不是让测试假绿。
+/// ② 禁用 → `set_dict_enabled` 把层从 composite 摘掉 → `Arc` 归零 → mmap 解除。
+/// ③ 此时删除**应当成功**。这一步才是用户真正要的东西。
+///
+/// 反向验证：把 `CodeTableEngine::set_dict_enabled` 的禁用分支换回
+/// `self.dm.set_layer_enabled(&nm, false)`（只翻标志、不摘层），③ 即变红。
+#[cfg(windows)]
+#[test]
+fn disabling_dict_releases_wdat_file_lock() {
+    let _serial = CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") {
+        eprintln!("跳过：无 wubi86 schema");
+        return;
+    }
+    // 取**启用**的扩展库（emoji 出厂启用且体积小）。
+    let src = dir.join("schemas/wubi86/wubi86_jidian_emoji.dict.yaml");
+    if !src.exists() {
+        eprintln!("跳过：该数据集无 emoji 扩展库");
+        return;
+    }
+    let main_src = dir.join("schemas/wubi86/wubi86_jidian.dict.yaml");
+    let (Some(wdat), Some(main_wdat)) = (runtime_wdat(&src), runtime_wdat(&main_src)) else {
+        eprintln!("跳过：本机取不到缓存根");
+        return;
+    };
+
+    let cfg = make_config(&["wubi86"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+    let cands = mgr.convert("aaaa", 20).candidates;
+    assert!(!cands.is_empty(), "前提：引擎应已构建并出候选");
+    assert!(
+        wdat.exists(),
+        "前提：启用的扩展库应已建出缓存: {}",
+        wdat.display()
+    );
+
+    // ⚠️ 判据必须走 **`DeleteFileW`**，不能用 Rust std（实测踩过两次）：
+    // `remove_file` 在新版 Windows 上走 POSIX 删除语义（`FileDispositionInfoEx`），
+    // `rename` 走的 `MoveFileEx` 在本机同样不被映射阻止 —— 加了「主库对照」才看清：
+    // 连必定被 mmap 的主库 wdat 都能被 std 改名。两个 API 都测不出用户遇到的占用。
+    // 用户是在资源管理器里删，走的正是 `DeleteFileW`，被映射时返回 ERROR_USER_MAPPED_FILE。
+
+    // ① 被 mmap 占着，应当删不掉。
+    //
+    // ⚠️ 若这一步竟然删成功了，有两种截然不同的可能，**必须当场区分**，否则要么假绿、
+    // 要么把环境问题误报成我们的 bug：
+    //   (a) 我们确实没释放 —— 真 bug；
+    //   (b) 本机的 mmap 压根不阻止删除 —— 判据没有前提。
+    // 用主库做对照来分辨（它必定被映射）。对照本身有破坏性（会删掉主库缓存，5MB，
+    // 下次构建重建），所以**只在走到这条岔路时才做**，正常机器上一次都不碰主库。
+    //
+    // 2026-09-14 在编译机（Windows，admin 账户）实测走的正是 (b)：主库 wdat 被引擎映射着，
+    // `DeleteFileW` 照样成功，`MoveFileEx` 与 `std::fs::remove_file` 亦然。也就是说
+    // `wind_dict::reader_pool` 模块注释里那句「文件被 mmap 期间 rename/删除会 Access Denied」
+    // 在那台机器上**不成立** —— 具体取决于 Windows 版本 / 文件系统 / 账户。
+    if delete_file_win32(&wdat).is_ok() {
+        if delete_file_win32(&main_wdat).is_ok() {
+            eprintln!(
+                "跳过：本机 mmap 不阻止 DeleteFileW（必定被映射的主库 wdat 同样可删），\
+                 无法在此环境验证「占用是否解除」。主库缓存已被对照删掉，下次构建会重建。"
+            );
+            return;
+        }
+        panic!(
+            "扩展库 wdat 在被引擎持有时竟可删除，而主库同时是锁住的 —— \
+             说明这个扩展库没走 mmap，或根本没被加载: {}",
+            wdat.display()
+        );
+    }
+
+    // ② 禁用 → 摘层 → 释放词典。
+    assert!(
+        mgr.set_dict_enabled_live("wubi86", "wubi86_emoji", false),
+        "禁用应即时生效"
+    );
+
+    // ③ 用户真正要的：现在删得掉了。
+    delete_file_win32(&wdat).unwrap_or_else(|e| {
+        panic!(
+            "禁用词库后其 wdat 缓存应能删除（t107 的核心诉求），实际: {e} —— {}",
+            wdat.display()
+        )
+    });
 }
 
 /// ★ 热插拔必须打到**混输方案内部**那份子引擎，不只是同名的独立方案。

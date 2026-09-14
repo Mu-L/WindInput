@@ -27,9 +27,9 @@ impl DictManager {
         self.composite.register_layer(layer);
     }
 
-    /// 按名注销一层。
-    pub fn unregister_layer(&self, name: &str) {
-        self.composite.unregister_layer(name);
+    /// 按名注销一层，返回是否真的摘掉了。摘层即释放该层持有的词典（含 mmap 句柄）。
+    pub fn unregister_layer(&self, name: &str) -> bool {
+        self.composite.unregister_layer(name)
     }
 
     /// 运行时启停某层（按名），用于码表扩展词库热插拔。返回是否命中。
