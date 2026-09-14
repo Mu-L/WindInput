@@ -193,6 +193,13 @@ extern const GUID c_guidDisplayAttributeConverted;
 //   Dota2CompatAlias  ← core 的 wind-coordinator::tsf_profile_name::ALIAS_VALUE 写、
 //                        Register.cpp 的 kAliasValueName 读。写错的表现是「升级后
 //                        用户的兼容别名被冲回真名」，只在重装时才暴露。
+//   InstallerRunning       ← 安装器写、IPCClient.cpp 读。安装期间不让本 DLL 拉起服务。
+//                            ⚠️ 值**必须**恒为 "1"：旧版读端用 WCHAR[8] 定长缓冲，
+//                            值一长就读成 ERROR_MORE_DATA、把「标记存在」看成「不存在」。
+//   InstallerRunningOwner  ← 同上一对写读。格式 "<pid>|<进程创建时间 FILETIME>"，
+//                            让读端能判断立标记的那个进程是否还活着 —— 没有它时，
+//                            一次中途失败的安装会把标记永久留下，表现为输入法整个
+//                            不工作且无提示（issue #120）。判定规则见 InstallerGuard.h。
 //
 // ⚠️ WIND_APP_REGKEY 下的 InstallDir 是**本 DLL 唯一可靠的安装目录来源**：
 // 本 DLL 被部署到系统目录（System32\IME\<app>\，见 docs 与安装器 system_subdir）后，

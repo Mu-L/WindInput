@@ -1,6 +1,7 @@
 #include "IPCClient.h"
 #include "FileLogger.h"
 #include "InstallPaths.h"
+#include "InstallerGuard.h"
 #include <sstream>
 #include <cstdarg>
 #include <cstring>
@@ -338,31 +339,163 @@ static inline BOOL _ResolveAppBaseDir(WCHAR* outDir, DWORD cchOutDir)
     return WindResolveInstallRoot(outDir, cchOutDir);
 }
 
+namespace
+{
+
+uint64_t FiletimeToU64(const FILETIME& ft)
+{
+    return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
+
+/// 立 `InstallerRunning` 的那个进程是否仍在运行。
+///
+/// 「拿不准就当它活着」是本函数一以贯之的取向：误判成死，会让闸门在真正的安装期间
+/// 失效——那正是它要防的事；误判成活，最多让用户多等到兜底生效。两种错的代价
+/// 不对称，所以每个取不到答案的分支都返回 true。
+///
+/// ⚠️ 正因为这些分支答的是「活着」，调用方**必须**另配一条与本函数无关的年龄硬兜底
+/// （`InstallerGuard::IsOwnerHardStale`）：跨用户、受保护进程、PID 被系统进程复用时
+/// 这里会永远答「活着」，只靠本函数的话那就是个没有出口的状态机。
+bool IsOwnerAlive(const InstallerGuard::Owner& owner)
+{
+    // PROCESS_QUERY_LIMITED_INFORMATION 是够用的最小权限：本 DLL 常跑在低权限宿主里，
+    // 而安装器是提权进程，要 PROCESS_QUERY_INFORMATION 会被直接拒。
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, owner.pid);
+    if (hProc == NULL)
+    {
+        // 进程确实不存在时是 ERROR_INVALID_PARAMETER；其余错误（尤以 ERROR_ACCESS_DENIED
+        // 为常见）只说明我们看不到它，不说明它没了。
+        return GetLastError() != ERROR_INVALID_PARAMETER;
+    }
+
+    FILETIME create{}, exitTime{}, kernelTime{}, userTime{};
+    const BOOL gotTimes = GetProcessTimes(hProc, &create, &exitTime, &kernelTime, &userTime);
+    DWORD exitCode = 0;
+    const BOOL gotCode = GetExitCodeProcess(hProc, &exitCode);
+    CloseHandle(hProc);
+
+    if (gotCode && exitCode != STILL_ACTIVE)
+    {
+        return false; // 句柄还开着，但进程已经退出
+    }
+    if (!gotTimes)
+    {
+        return true;
+    }
+    // 这一步才是 PID 复用的解药：PID 还在，但已经是别的进程了，创建时间对不上。
+    return FiletimeToU64(create) == owner.createTime;
+}
+
+} // namespace
+
+bool CIPCClient::_InstallerGuardBlocks()
+{
+    HKEY hKey = NULL;
+    // KEY_WOW64_64KEY 理由同 InstallPaths.cpp：安装器是 64 位、只写得进 64 位视图，
+    // 32 位这侧不加标志就读不到这个标记，安装/卸载期间会把服务重新拉起来。
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, WIND_APP_REGKEY, 0, KEY_READ | KEY_WOW64_64KEY,
+                      &hKey) != ERROR_SUCCESS)
+    {
+        return false;
+    }
+
+    // ⚠️ 缓冲仍是 8 个 WCHAR，且这个值的内容**必须**保持 "1" —— 旧版 DLL 用的正是这个
+    // 定长缓冲，值一长就读成 ERROR_MORE_DATA、把「标记存在」看成「不存在」。
+    // 身份信息因此另放 InstallerRunningOwner，详见 InstallerGuard.h。
+    WCHAR flag[8] = {};
+    DWORD flagSize = sizeof(flag);
+    DWORD flagType = REG_SZ;
+    const LSTATUS flagStatus = RegQueryValueExW(hKey, L"InstallerRunning", nullptr, &flagType,
+                                                reinterpret_cast<LPBYTE>(flag), &flagSize);
+    // ERROR_MORE_DATA 也算「标记存在」：值超长时这里一个字节都拿不到，但「有这个值」本身
+    // 已经是答案。旧读端在这一支上把标记看成了不存在（闸门静默失效），新读端不继承那个
+    // 脆弱性——取向仍是「拿不准就当装着」。
+    const bool hasFlag = (flagStatus == ERROR_SUCCESS && flag[0] == L'1') ||
+                         flagStatus == ERROR_MORE_DATA;
+
+    InstallerGuard::Owner owner;
+    bool hasOwner = false;
+    uint64_t keyWriteFt = 0;
+    if (hasFlag)
+    {
+        WCHAR ownerBuf[64] = {};
+        DWORD ownerSize = sizeof(ownerBuf) - sizeof(WCHAR); // 给终止符留位
+        DWORD ownerType = REG_SZ;
+        if (RegQueryValueExW(hKey, L"InstallerRunningOwner", nullptr, &ownerType,
+                             reinterpret_cast<LPBYTE>(ownerBuf), &ownerSize) == ERROR_SUCCESS)
+        {
+            // 注册表里的字符串不保证带终止符。上面的零初始化与 ownerSize 留位已经保证了
+            // 这里必有终止符，这一行是多余的保险，不是在补一个真实存在的洞。
+            ownerBuf[ARRAYSIZE(ownerBuf) - 1] = L'\0';
+            hasOwner = InstallerGuard::ParseOwner(ownerBuf, &owner);
+        }
+        if (!hasOwner)
+        {
+            // 没有身份可查（旧安装器写的标记）时才需要年龄兜底。
+            FILETIME ftWrite{};
+            if (RegQueryInfoKeyW(hKey, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                 nullptr, nullptr, nullptr, nullptr, &ftWrite) == ERROR_SUCCESS)
+            {
+                keyWriteFt = FiletimeToU64(ftWrite);
+            }
+        }
+    }
+    RegCloseKey(hKey);
+
+    if (!hasFlag)
+    {
+        return false;
+    }
+
+    FILETIME nowRaw{};
+    GetSystemTimeAsFileTime(&nowRaw);
+    const uint64_t nowFt = FiletimeToU64(nowRaw);
+
+    bool ownerAlive = false;
+    bool staleByAge = false;
+    bool ownerHardStale = false;
+    if (hasOwner)
+    {
+        ownerHardStale = InstallerGuard::IsOwnerHardStale(owner.createTime, nowFt);
+        ownerAlive = IsOwnerAlive(owner);
+        if (ownerHardStale)
+        {
+            _LogInfo(L"InstallerRunning 的主人进程 %u 启动至今已超过 %llu 小时，"
+                     L"无论是否仍可见都按陈旧标记处理，照常启动服务",
+                     owner.pid,
+                     static_cast<unsigned long long>(InstallerGuard::kOwnerHardStaleMs / 3600000ull));
+        }
+        else if (!ownerAlive)
+        {
+            _LogInfo(L"InstallerRunning 的主人进程 %u 已不在，按陈旧标记处理，照常启动服务",
+                     owner.pid);
+        }
+    }
+    else
+    {
+        // keyWriteFt 取不到时保持 false（即按「还新鲜」处理）：宁可多等，不可误放。
+        staleByAge = keyWriteFt != 0 && InstallerGuard::IsStaleByAge(keyWriteFt, nowFt);
+        if (staleByAge)
+        {
+            _LogInfo(L"InstallerRunning 无 Owner 且已超过 %llu 分钟未更新，按陈旧标记处理",
+                     static_cast<unsigned long long>(InstallerGuard::kStaleAfterMs / 60000ull));
+        }
+    }
+
+    return InstallerGuard::ShouldBlockStart(true, hasOwner, ownerAlive, staleByAge, ownerHardStale);
+}
+
 BOOL CIPCClient::_StartService()
 {
     _LogInfo(L"Attempting to start service...");
 
-    // Guard: installer running flag — set by NSIS before killing processes,
-    // cleared after installation completes. Prevents respawn during install/uninstall.
+    // Guard: installer running flag — 安装器在杀进程前立、装完清，防止本 DLL 在安装
+    // 期间把主程序重新拉起来。判定逻辑（含「立标记的进程是否还活着」这条兜底）在
+    // InstallerGuard.h，那里有完整的来龙去脉与 issue #120 的实测记录。
+    if (_InstallerGuardBlocks())
     {
-        HKEY hKey = NULL;
-        // KEY_WOW64_64KEY 理由同 InstallPaths.cpp：安装器是 64 位、只写得进 64 位视图，
-        // 32 位这侧不加标志就读不到这个标记，安装/卸载期间会把服务重新拉起来。
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, WIND_APP_REGKEY, 0, KEY_READ | KEY_WOW64_64KEY,
-                          &hKey) == ERROR_SUCCESS)
-        {
-            WCHAR value[8] = {};
-            DWORD size = sizeof(value);
-            DWORD type = REG_SZ;
-            BOOL found = (RegQueryValueExW(hKey, L"InstallerRunning", nullptr, &type,
-                                           reinterpret_cast<LPBYTE>(value), &size) == ERROR_SUCCESS);
-            RegCloseKey(hKey);
-            if (found && value[0] == L'1')
-            {
-                _LogInfo(L"InstallerRunning flag set, not starting service");
-                return FALSE;
-            }
-        }
+        _LogInfo(L"InstallerRunning flag set, not starting service");
+        return FALSE;
     }
 
     WCHAR baseDir[MAX_PATH];

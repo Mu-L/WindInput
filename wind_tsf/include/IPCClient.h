@@ -456,6 +456,13 @@ private:
     static std::wstring _Utf8ToWide(const char* utf8, size_t length);
     static std::string _WideToUtf8(const std::wstring& wide);
 
+    /// 安装器闸门：`HKLM\Software\<app>\InstallerRunning` 是否**当前有效**地要求不启动服务。
+    ///
+    /// 与单看那个值的区别在于「有效」二字：立标记的安装器进程若异常死亡，标记会永久
+    /// 残留，表现为输入法整个不工作且无任何提示（issue #120）。故本函数还要校验
+    /// `InstallerRunningOwner` 记下的那个进程是否仍在。判定规则见 InstallerGuard.h。
+    static bool _InstallerGuardBlocks();
+
     // Logging helpers
     static void _Log(IPCLogLevel level, const wchar_t* format, ...);
     static void _LogError(const wchar_t* format, ...);

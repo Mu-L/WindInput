@@ -122,8 +122,8 @@ target_sources(${TSF_TARGET_NAME} PRIVATE ${CMAKE_BINARY_DIR}/${TSF_TARGET_NAME}
 
 # ── 单元测试（默认 OFF，不影响 DLL 构建）───────────────────────────────────
 #
-# 目前只有 SkipKeyTable。本目录绝大多数代码与 TSF/COM 纠缠、测不动；SkipKeyTable 是
-# 被刻意剥出来的纯逻辑（不含任何 Win32 头，时钟由调用方以 GetTickCount64 传入），
+# 目前有 SkipKeyTable 与 InstallerGuard。本目录绝大多数代码与 TSF/COM 纠缠、测不动；
+# 这两个是被刻意剥出来的纯逻辑（不含任何 Win32 头，时钟与进程存活由调用方传入），
 # 所以能测。PairEngine、ClassifyInputKey 这类纯判据日后可照同一条路补进来。
 #
 # 本机跑（不需要 MSVC，msys2 的 g++ 即可，这是主要跑法）：
@@ -140,4 +140,11 @@ if(WIND_TSF_TESTS)
         target_compile_options(skip_key_table_test PRIVATE /utf-8 /W4)
     endif()
     add_test(NAME skip_key_table COMMAND skip_key_table_test)
+
+    add_executable(installer_guard_test tests/installer_guard_test.cpp)
+    target_include_directories(installer_guard_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(installer_guard_test PRIVATE /utf-8 /W4)
+    endif()
+    add_test(NAME installer_guard COMMAND installer_guard_test)
 endif()
